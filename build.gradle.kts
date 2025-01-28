@@ -276,6 +276,8 @@ dependencies {
     testImplementation(libs.clojure.tools.cli)
 
     devImplementation("mount", "mount", "0.1.20")
+    devImplementation("com.github.juxt-forks", "spyscope", "477ee5bd74fe2a990a5f0fc67ea292d71fa427bd")
+    devImplementation("io.github.nextjournal", "clerk", "0.17.1102")
     devImplementation("integrant", "repl", "0.3.2")
     devImplementation("com.azure", "azure-identity", "1.9.0")
     devImplementation("com.taoensso", "tufte", "2.6.3")
