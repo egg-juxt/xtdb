@@ -1,8 +1,10 @@
 (ns scenarios.load-test
   (:require [clojure.java.io :as io]
             [clojure.pprint :refer [print-table]]
+            [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
-            [java-time.api :as jt]
+            [clojure.pprint :refer [pprint]]
+            [java-time.api :as t]
             [mount.core :as mount :refer [defstate]]
             [xtdb.api :as xt]
             [xtdb.node :as xtnode]
@@ -30,21 +32,25 @@
   :start (xtnode/start-node (make-node-conf "small"))
   :stop (xtutil/close node-small))
 
+(defn rm-dataset [name]
+  (sh "rm" "-rf" (str "datasets/" name)))
 
 ;; Seeding
 
-(defn every-5-min [start-date end-date]
-   (->> (iterate #(jt/plus % (jt/duration 5 :minutes)) start-date)
-     (take-while #(jt/not-after? % end-date))
-     (map #(jt/instant % (jt/zone-id "UTC")))))
+(defn periodic-instants [duration from-local-date to-local-date]
+  (->> (iterate #(t/plus % duration) from-local-date)
+    (take-while #(t/not-after? % to-local-date))
+    (map #(t/instant % (t/zone-id "UTC")))))
 
 (comment
-  (take 10 (every-5-min
-             (jt/local-date-time 2024 1 1 0 0)
-             (jt/local-date-time 2024 1 15 0 0)))
-  (take-last 10 (every-5-min
-                  (jt/local-date-time 2024 1 1 0 0)
-                  (jt/local-date-time 2024 1 15 0 0))))
+  (take 10 (periodic-instants
+             (t/duration 5 :minutes)
+             (t/local-date-time 2024 1 1 0 0)
+             (t/local-date-time 2024 1 15 0 0)))
+  (take-last 10 (periodic-instants
+                  (t/duration 5 :minutes)
+                  (t/local-date-time 2024 1 1 0 0)
+                  (t/local-date-time 2024 1 15 0 0))))
 
 (defn rand-int-between [minv maxv]
   (+ minv (rand-int (- maxv minv))))
@@ -60,13 +66,13 @@
         :value value}])))
 
 (defn random-days-off [from to]
-  (let [total-days (jt/time-between from to :days)]
+  (let [total-days (t/time-between from to :days)]
     (for [d (range 0 total-days 7)]
       (+ d (rand-int 7)))))
 
 (comment
-  (random-days-off (jt/instant "2024-01-01T00:00:00Z")
-                   (jt/instant "2024-01-20T00:00:00Z")))
+  (random-days-off (t/instant "2024-01-01T00:00:00Z")
+                   (t/instant "2024-01-20T00:00:00Z")))
 
 (defn add-days-off-txs [put-docs-tx off-data]
   (let [table (-> put-docs-tx second :into)
@@ -76,8 +82,8 @@
     (concat
       [put-docs-tx]
       (for [day-off (random-days-off v-from v-to)]
-        (let [day-off-from (-> v-from (jt/plus (jt/duration day-off :days)))
-              day-off-to (-> day-off-from (jt/plus (jt/duration 1 :days)))]
+        (let [day-off-from (-> v-from (t/plus (t/duration day-off :days)))
+              day-off-to (-> day-off-from (t/plus (t/duration 1 :days)))]
           [:put-docs {:into table
                       :valid-from day-off-from
                       :valid-to day-off-to}
@@ -105,6 +111,23 @@
                         :prop1 "yes"}]
                       {:prop1 "no"})))
 
+(defn seed-forecasts [{:keys [customer-profile-count from to]}]
+  (for [forecast-release-instant (periodic-instants (t/duration 15 :minutes) from to)
+        customer-profile-id (range customer-profile-count)
+        value-time (periodic-instants (t/duration 30 :minutes) ; todo: fix: 30 minutes round the hour
+                     forecast-release-instant
+                     (t/plus forecast-release-instant (t/duration 7 :days)))]
+    [[:put-docs {:into :load_forecast_7d_value
+                 :valid-from value-time}
+      {:xt/id customer-profile-id
+       :value 1000}]
+     {:system-time forecast-release-instant}]))
+
+(comment
+  (take 10 (seed-forecasts {:customer-profile-count 1
+                            :from (t/local-date-time 2024 1 1 0 0)
+                            :to (t/local-date-time 2024 1 2 0 0)})))
+
 (defn interleave-submit-args [submit-args-1 submit-args-2]
   (cond
     (empty? submit-args-1) submit-args-2
@@ -113,10 +136,10 @@
     (lazy-seq
       (let [d1 (-> submit-args-1 first second :system-time)
             d2 (-> submit-args-2 first second :system-time)]
-        (assert (jt/instant? d1))
-        (assert (jt/instant? d2))
+        (assert (t/instant? d1))
+        (assert (t/instant? d2))
         (cond
-          (jt/not-after? d1 d2)
+          (t/not-after? d1 d2)
           (cons (first submit-args-1)
                 (interleave-submit-args (rest submit-args-1) submit-args-2))
 
@@ -126,10 +149,10 @@
 
 (comment
   (interleave-submit-args
-    [[[:put-docs {:into :site} {:xt/id "site2"}] {:system-time (jt/instant "2024-01-02T00:00:00Z")}]
-     [[:put-docs {:into :site} {:xt/id "site4"}] {:system-time (jt/instant "2024-01-04T00:00:00Z")}]]
-    [[[:put-docs {:into :site} {:xt/id "site1"}] {:system-time (jt/instant "2024-01-01T00:00:00Z")}]
-     [[:put-docs {:into :site} {:xt/id "site5"}] {:system-time (jt/instant "2024-01-05T00:00:00Z")}]]))
+    [[[:put-docs {:into :site} {:xt/id "site2"}] {:system-time (t/instant "2024-01-02T00:00:00Z")}]
+     [[:put-docs {:into :site} {:xt/id "site4"}] {:system-time (t/instant "2024-01-04T00:00:00Z")}]]
+    [[[:put-docs {:into :site} {:xt/id "site1"}] {:system-time (t/instant "2024-01-01T00:00:00Z")}]
+     [[:put-docs {:into :site} {:xt/id "site5"}] {:system-time (t/instant "2024-01-05T00:00:00Z")}]]))
 
 (defn batch-submit-args [node max-batch-size submit-args-seq]
   (let [submitted-count (atom 0)]
@@ -142,16 +165,52 @@
         submit-args))))
 
 
+; Seed scenario of only forecasts
+
+(comment
+  (mount/stop #'node-small)
+  (rm-dataset "small")
+
+  (mount/start #'node-small)
+
+  (doseq [submit-args (batch-submit-args "node" 1000
+                        (seed-forecasts {:customer-profile-count 1
+                                         :from (t/local-date-time 2024 1 1 0 0)
+                                         :to (t/local-date-time 2024 1 2 0 0)}))]
+    ;(pprint submit-args)
+    (apply xt/submit-tx node-small submit-args))
+
+  (xt/q node-small
+    "SELECT DISTINCT _valid_from FROM load_forecast_7d_value
+     FOR VALID_TIME FROM DATE '2024-01-01' TO DATE '2024-01-10'
+     ORDER BY _valid_from")
+
+  (xt/q node-small
+    "SELECT DISTINCT _system_from FROM load_forecast_7d_value
+     FOR VALID_TIME FROM DATE '2024-01-01' TO DATE '2024-01-10'
+     FOR SYSTEM_TIME ALL
+     ORDER BY _system_from")
+
+  (->> (xt/q node-small
+         "SELECT _valid_from, _system_from, * FROM load_forecast_7d_value
+          FOR VALID_TIME FROM DATE '2024-01-01' TO DATE '2024-01-10'
+          ORDER BY _valid_from")
+    (map (juxt :xt/valid-from :value :xt/system-from)))
+
+
+  ,)
+
+
 ; Small scenario ------------------------------------------
 
 (defn seed-readings--submit-args [{:keys [system-count from to]}]
-  (->> (seed-readings-tx system-count (every-5-min from to))
+  (->> (seed-readings-tx system-count (periodic-instants (t/duration 5 :minutes) from to))
     (map (fn submit-as-of-valid-to [put-docs]
            [put-docs {:system-time (-> put-docs second :valid-to)}]))))
 
 (defn seed-systems--submit-args [{:keys [system-count from to]}]
   (->> (for [system-id (range system-count)]
-         (seed-system-tx system-id (jt/instant from (jt/zone-id "UTC")) (jt/instant to (jt/zone-id "UTC"))))
+         (seed-system-tx system-id (t/instant from (t/zone-id "UTC")) (t/instant to (t/zone-id "UTC"))))
     (apply concat)
     (map (fn submit-as-of-valid-from [put-docs]
            [put-docs {:system-time (-> put-docs second :valid-from)}]))
@@ -170,15 +229,15 @@
   (mount/stop #'node-small)
 
   (seed-scenario node-small {:system-count 1
-                             :from (jt/local-date-time 2024 1 1 0 0)
-                             :to (jt/local-date-time 2024 1 15 0 0)})
+                             :from (t/local-date-time 2024 1 1 0 0)
+                             :to (t/local-date-time 2024 1 15 0 0)})
 
   (mount/start #'node-load1)
   (mount/stop #'node-load1)
 
   (seed-scenario node-load1 {:system-count 500
-                             :from (jt/local-date-time 2024 1 1 0 0)
-                             :to (jt/local-date-time 2024 7 1 0 0)}) ; => 26262000 records
+                             :from (t/local-date-time 2024 1 1 0 0)
+                             :to (t/local-date-time 2024 7 1 0 0)}) ; => 26262000 records
 
   ,)
 
@@ -195,14 +254,14 @@
 
 (defn render-date [d]
   (cond
-    (jt/local-date d) (str "DATE '" d "'")))
+    (t/local-date d) (str "DATE '" d "'")))
 
 (defn for-valid-time [from to]
   (str "FOR VALID_TIME FROM " (render-date from) " TO " (render-date to)
        #_" FOR SYSTEM_TIME ALL"))
 
 (comment
-  (for-valid-time (jt/local-date 2024 1 1) (jt/local-date 2024 1 1)))
+  (for-valid-time (t/local-date 2024 1 1) (t/local-date 2024 1 1)))
 
 (defn vpp-systems-raw [{:keys [system-count from to]}]
   (str
@@ -248,16 +307,16 @@
 
 ; Filtering issue
 
-(def my-from (jt/local-date 2024 1 1))
-(def my-to (jt/local-date 2024 1 8))
+(def my-from (t/local-date 2024 1 1))
+(def my-to (t/local-date 2024 1 8))
 
 (comment
   (mount/start #'node-small)
 
   ; issue takes place on datasets of considerable size, presumable > 100000 records
   (seed-systems-only node-small {:system-count 2000
-                                 :from (jt/local-date-time 2024 1 1 0 0)
-                                 :to (jt/local-date-time 2024 7 1 0 0)}) ; => 216000
+                                 :from (t/local-date-time 2024 1 1 0 0)
+                                 :to (t/local-date-time 2024 7 1 0 0)}) ; => 216000
 
   (def my-node node-small)
 
