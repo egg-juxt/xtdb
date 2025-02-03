@@ -3,7 +3,6 @@
             [clojure.pprint :refer [print-table]]
             [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]
             [java-time.api :as t]
             [mount.core :as mount :refer [defstate]]
             [xtdb.api :as xt]
@@ -42,6 +41,8 @@
     (take-while #(t/not-after? % to-local-date))
     (map #(t/instant % (t/zone-id "UTC")))))
 
+(comment
+  (t/instant (t/local-date-time 2024 1 1 0 0) (t/zone-id "UTC")))
 (comment
   (take 10 (periodic-instants
              (t/duration 5 :minutes)
@@ -110,23 +111,6 @@
                         :system_id id
                         :prop1 "yes"}]
                       {:prop1 "no"})))
-
-(defn seed-forecasts [{:keys [customer-profile-count from to]}]
-  (for [forecast-release-instant (periodic-instants (t/duration 15 :minutes) from to)
-        customer-profile-id (range customer-profile-count)
-        value-time (periodic-instants (t/duration 30 :minutes) ; todo: fix: 30 minutes round the hour
-                     forecast-release-instant
-                     (t/plus forecast-release-instant (t/duration 7 :days)))]
-    [[:put-docs {:into :load_forecast_7d_value
-                 :valid-from value-time}
-      {:xt/id customer-profile-id
-       :value 1000}]
-     {:system-time forecast-release-instant}]))
-
-(comment
-  (take 10 (seed-forecasts {:customer-profile-count 1
-                            :from (t/local-date-time 2024 1 1 0 0)
-                            :to (t/local-date-time 2024 1 2 0 0)})))
 
 (defn interleave-submit-args [submit-args-1 submit-args-2]
   (cond
@@ -252,12 +236,14 @@
 
 ;; Queries
 
-(defn render-date [d]
+(defn render-sql [d]
   (cond
-    (t/local-date d) (str "DATE '" d "'")))
+    (t/local-date? d) (str "DATE '" d "'")
+    (t/local-date-time? d) (str "TIMESTAMP '" d "'")
+    :else (assert false)))
 
 (defn for-valid-time [from to]
-  (str "FOR VALID_TIME FROM " (render-date from) " TO " (render-date to)
+  (str "FOR VALID_TIME FROM " (render-sql from) " TO " (render-sql to)
        #_" FOR SYSTEM_TIME ALL"))
 
 (comment
@@ -503,4 +489,6 @@
   (run-readings node-load1 {:results-file "readings-results.edn"
                             :timeout (* 1 60 1000)})
 
-  (print-results {:filename "readings-results.edn"}))
+  (print-results {:filename "readings-results.edn"})
+
+  ,)
