@@ -266,6 +266,9 @@ exprPrimary
 
     | (schemaName '.')? 'VERSION' '(' ')' #PostgresVersionFunction
 
+    | (schemaName '.')? 'PG_GET_USERBYID' '(' relOwner=columnReference ')' # PostgresGetUserByIdFunction
+    | (schemaName '.')? 'PG_TABLE_IS_VISIBLE' '(' columnOid=columnReference ')' # PostgresTableIsVisibleFunction
+
     // numeric value functions
     | 'POSITION' '(' expr 'IN' expr ( 'USING' charLengthUnits )? ')' # PositionFunction
     | 'EXTRACT' '(' extractField 'FROM' extractSource ')' # ExtractFunction
@@ -319,6 +322,8 @@ exprPrimary
     | (schemaName '.')? 'PG_GET_EXPR' ('(' expr ',' expr (',' expr)? ')')? # PgGetExprFunction
     | (schemaName '.')? '_PG_EXPANDARRAY' ('(' expr ')')? # PgExpandArrayFunction
     | (schemaName '.')? 'PG_GET_INDEXDEF' '(' expr (',' expr ',' expr)? ')' # PgGetIndexdefFunction
+    | PG_SLEEP '(' sleepSeconds=expr ')' # PgSleepFunction
+    | PG_SLEEP_FOR '(' sleepPeriod=expr ')' # PgSleepForFunction
 
     | currentInstantFunction # CurrentInstantFunction0
     | 'CURRENT_SETTING' '(' expr ')' #CurrentSettingFunction
@@ -539,7 +544,7 @@ tableReference
     | subquery tableAlias tableProjection? # DerivedTable
     | 'LATERAL' subquery tableAlias tableProjection? # LateralDerivedTable
     | 'UNNEST' '(' expr ')' withOrdinality? tableAlias tableProjection? # CollectionDerivedTable
-    | generateSeries tableAlias tableProjection? # GenerateSeriesTable
+    | generateSeries withOrdinality? tableAlias tableProjection? # GenerateSeriesTable
     | 'ARROW_TABLE' '(' characterString ')' tableAlias tableProjection # ArrowTable
     | '(' tableReference ')' # WrappedTableReference
     ;

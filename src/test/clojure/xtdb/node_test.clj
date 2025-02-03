@@ -716,7 +716,7 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
                    :rows-per-chunk 16}]
     (util/delete-dir node-dir)
     (dotimes [_ 5]
-      (with-open [node (tu/->local-node node-opts)]
+      (util/with-open [node (tu/->local-node node-opts)]
         (doseq [tx (->> (random-maps 32)
                         (map #(vector :put-docs :docs %))
                         (partition-all 16))]
@@ -724,10 +724,9 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
 (deftest test-plan-query-cache
   (let [query-src ^IQuerySource (tu/component :xtdb.query/query-source)
-        wm-src (tu/component :xtdb/indexer)
-        pq1 (.planQuery query-src "SELECT 1" wm-src {})
-        pq2 (.planQuery query-src "SELECT 1" wm-src {:explain? true})
-        pq3 (.planQuery query-src "SELECT 1" wm-src {})]
+        pq1 (.planQuery query-src "SELECT 1" {})
+        pq2 (.planQuery query-src "SELECT 1" {:explain? true})
+        pq3 (.planQuery query-src "SELECT 1" {})]
 
     ;;could add explicit test for all query options that are relevant to planning
 
@@ -741,15 +740,15 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
 
        (tu/then-await-tx tx-id tu/*node*)
 
-       (let [pq4 (.planQuery query-src "SELECT 1" wm-src {:after-tx-id tx-id})]
+       (let [pq4 (.planQuery query-src "SELECT 1" {:after-tx-id tx-id})]
 
          (t/is (not (identical? pq1 pq4))
                "changing table-info causes previous cache-hits to miss")))))
 
 (deftest test-prepared-statements
-  (let [tx (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1 :a "one" :b 2}]
-                                    [:put-docs :unrelated-table {:xt/id 1 :a "a-string"}]])]
-    (tu/then-await-tx tx tu/*node*))
+  (-> (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1 :a "one" :b 2}]
+                               [:put-docs :unrelated-table {:xt/id 1 :a "a-string"}]])
+      (tu/then-await-tx tu/*node* #xt/duration "PT2S"))
 
   (let [pq (xtp/prepare-sql tu/*node* "SELECT foo.*, ? FROM foo" {:param-types [:i64]})
         column-fields [#xt.arrow/field ["_id" #xt.arrow/field-type [#xt.arrow/type :i64 false]]
@@ -917,3 +916,13 @@ VALUES(1, OBJECT (foo: OBJECT(bibble: true), bar: OBJECT(baz: 1001)))"]])
   (t/is (thrown-with-msg? IllegalArgumentException
                           #"Port value out of range: 99999"
                           (xtn/start-node {:server {:port 99999}}))))
+
+(t/deftest test-ts-tz-zone-first-wins-3723
+  (xt/execute-tx tu/*node*
+                 [[:put-docs :docs
+                   {:xt/id 1 :ts #xt/zoned-date-time "2021-10-21T12:00+00:00[America/Los_Angeles]"}
+                   {:xt/id 2 :ts #xt/zoned-date-time "2021-10-21T12:00+04:00"}
+                   {:xt/id 3 :ts #xt/offset-date-time "2021-10-21T12:00+02:00"}]])
+
+  (t/is (= [{:xt/id 1, :tz -7} {:xt/id 2, :tz 4} {:xt/id 3, :tz 2}]
+           (xt/q tu/*node* "SELECT _id, EXTRACT(TIMEZONE_HOUR FROM ts) as tz from docs ORDER BY _id"))))

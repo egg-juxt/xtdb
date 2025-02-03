@@ -26,7 +26,7 @@
            xtdb.api.module.XtdbModule$Factory
            (xtdb.api.query XtqlQuery)
            [xtdb.api.tx TxOp]
-           xtdb.indexer.IIndexer
+           (xtdb.indexer IIndexer LiveIndex LogProcessor)
            (xtdb.query IQuerySource PreparedQuery)))
 
 (set! *unchecked-math* :warn-on-boxed)
@@ -45,7 +45,7 @@
       (update :snapshot-time #(some-> % (time/->instant)))
       (update :current-time #(some-> % (time/->instant)))))
 
-(defn- validate-snapshot-not-before [^TransactionKey latest-completed-tx snapshot-time]
+(defn- validate-snapshot-not-before [snapshot-time ^TransactionKey latest-completed-tx]
   (when (and snapshot-time (or (nil? latest-completed-tx) (neg? (compare (.getSystemTime latest-completed-tx) snapshot-time))))
     (throw (err/illegal-arg :xtdb/unindexed-tx
                             {::err/message (format "snapshot-time (%s) is after the latest completed tx (%s)"
@@ -68,8 +68,10 @@
 
 (defrecord Node [^BufferAllocator allocator
                  ^IIndexer indexer
+                 ^LiveIndex live-idx
                  ^Log log
-                 ^IQuerySource q-src, wm-src, scan-emitter
+                 ^LogProcessor log-processor
+                 ^IQuerySource q-src, scan-emitter
                  ^CompositeMeterRegistry metrics-registry
                  default-tz
                  system, close-fn,
@@ -95,8 +97,9 @@
 
   (execute-tx [this tx-ops opts]
     (let [tx-id (xtp/submit-tx this tx-ops opts)]
-      (or (let [tx-res (.awaitTx indexer tx-id nil)]
-            (when (and (instance? TransactionResult tx-res)
+      (or (let [^TransactionResult tx-res (-> @(.awaitAsync log-processor tx-id)
+                                              (util/rethrowing-cause))]
+            (when (and tx-res
                        (= (.getTxId tx-res) tx-id))
               tx-res))
 
@@ -117,13 +120,13 @@
   (open-xtql-query [this query query-opts]
     (let [query-opts (-> query-opts (with-query-opts-defaults this))]
       (-> (xtp/prepare-xtql this query query-opts)
-          (then-execute-prepared-query allocator query-timer query-opts))) )
+          (then-execute-prepared-query allocator query-timer query-opts))))
 
   xtp/PStatus
-  (latest-completed-tx [_] (.latestCompletedTx indexer))
-  (latest-submitted-tx-id [_] (.latestSubmittedTxId log))
+  (latest-completed-tx [_] (.getLatestCompletedTx live-idx))
+  (latest-submitted-tx-id [_] (.getLatestSubmittedOffset log))
   (status [this]
-    {:latest-completed-tx (.latestCompletedTx indexer)
+    {:latest-completed-tx (.getLatestCompletedTx live-idx)
      :latest-submitted-tx-id (xtp/latest-submitted-tx-id this)})
 
   xtp/PLocalNode
@@ -135,10 +138,12 @@
                                               {::err/message (format "Unsupported SQL query type: %s" (type query))})))
 
           {:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
-      (doto (.awaitTx indexer after-tx-id tx-timeout)
-        (validate-snapshot-not-before snapshot-time))
-      (let [plan (.planQuery q-src ast wm-src query-opts)]
-        (.prepareRaQuery q-src plan wm-src query-opts))))
+
+      (xt-log/await-tx this after-tx-id tx-timeout)
+
+      (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
+      (let [plan (.planQuery q-src ast query-opts)]
+        (.prepareRaQuery q-src plan query-opts))))
 
   (prepare-xtql [this query query-opts]
    (let [{:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))
@@ -147,18 +152,18 @@
                (instance? XtqlQuery query) query
                :else (throw (err/illegal-arg :xtdb/unsupported-query-type
                              {::err/message (format "Unsupported XTQL query type: %s" (type query))})))]
-     (doto (.awaitTx indexer after-tx-id tx-timeout)
-       (validate-snapshot-not-before snapshot-time))
+     (xt-log/await-tx this after-tx-id tx-timeout)
+     (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
 
-     (let [plan (.planQuery q-src ast wm-src query-opts)]
-       (.prepareRaQuery q-src plan wm-src query-opts))))
+     (let [plan (.planQuery q-src ast query-opts)]
+       (.prepareRaQuery q-src plan query-opts))))
 
   (prepare-ra [this plan query-opts]
     (let [{:keys [snapshot-time ^long after-tx-id tx-timeout] :as query-opts} (-> query-opts (with-query-opts-defaults this))]
-      (doto (.awaitTx indexer after-tx-id tx-timeout)
-        (validate-snapshot-not-before snapshot-time))
+      (xt-log/await-tx this after-tx-id tx-timeout)
+     (validate-snapshot-not-before snapshot-time (xtp/latest-completed-tx this))
 
-     (.prepareRaQuery q-src plan wm-src query-opts)))
+     (.prepareRaQuery q-src plan query-opts)))
 
   Closeable
   (close [_]
@@ -171,8 +176,9 @@
 (defmethod ig/prep-key :xtdb/node [_ opts]
   (merge {:allocator (ig/ref :xtdb/allocator)
           :indexer (ig/ref :xtdb/indexer)
-          :wm-src (ig/ref :xtdb/indexer)
+          :live-idx (ig/ref :xtdb.indexer/live-index)
           :log (ig/ref :xtdb/log)
+          :log-processor (ig/ref :xtdb.log/processor)
           :default-tz (ig/ref :xtdb/default-tz)
           :q-src (ig/ref :xtdb.query/query-source)
           :scan-emitter (ig/ref :xtdb.operator.scan/scan-emitter)
@@ -215,11 +221,13 @@
 
 (defn node-system [^Xtdb$Config opts]
   (let [srv-config (.getServer opts)
-        healthz (.getHealthz opts)]
+        healthz (.getHealthz opts)
+        indexer-cfg (.getIndexer opts)]
     (-> {:xtdb/node {}
          :xtdb/allocator {}
          :xtdb/indexer {}
-         :xtdb.log/watcher {}
+         :xtdb/trie-catalog {}
+         :xtdb.log/processor {:chunk-flush-duration (.getFlushDuration indexer-cfg)}
          :xtdb.metadata/metadata-manager {}
          :xtdb.operator.scan/scan-emitter {}
          :xtdb.query/query-source {}
@@ -227,12 +235,11 @@
          :xtdb.metrics/registry {}
          :xtdb/authn (.getAuthn opts)
 
-         :xtdb/log (.getTxLog opts)
+         :xtdb/log (.getLog opts)
          :xtdb/buffer-pool (.getStorage opts)
-         :xtdb.indexer/live-index (.getIndexer opts)
+         :xtdb.indexer/live-index indexer-cfg
          :xtdb/modules (.getModules opts)
-         :xtdb/default-tz (.getDefaultTz opts)
-         :xtdb.stagnant-log-flusher/flusher (.getIndexer opts)}
+         :xtdb/default-tz (.getDefaultTz opts)}
         (cond-> srv-config (assoc :xtdb.pgwire/server srv-config)
                 healthz (assoc :xtdb/healthz healthz))
         (doto ig/load-namespaces))))

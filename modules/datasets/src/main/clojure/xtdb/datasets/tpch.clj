@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [cognitect.transit :as t]
+            [next.jdbc :as jdbc]
             [xtdb.api :as xt]
             [xtdb.serde :as serde]
             [xtdb.time :as time]
@@ -108,6 +109,27 @@
                    (log/debug "Transacted" doc-count (.getTableName table))
                    last-tx))
                nil)))
+
+(defn submit-dml-jdbc! [conn scale-factor]
+  (log/info "Transacting TPC-H tables...")
+  (doseq [^TpchTable table (TpchTable/getTables)]
+    (let [dml (tpch-table->dml table)
+          doc-count (->> (tpch-table->dml-params table scale-factor)
+                         (partition-all 1000)
+                         (transduce (map (fn [param-batch]
+                                           (jdbc/with-transaction [tx conn]
+                                             (jdbc/execute-batch! tx dml param-batch {}))
+                                           (count param-batch)))
+                                    + 0))]
+      (log/debug "Transacted" doc-count (.getTableName table)))))
+
+(comment
+  (with-open [conn (jdbc/get-connection {:dbname "xtdb"
+                                         :host "localhost"
+                                         :port 5432
+                                         :classname "xtdb.jdbc.Driver"
+                                         :dbtype "xtdb"})]
+    (submit-dml-jdbc! conn 0.05)))
 
 (defn dump-tpch-log-files [^File root-dir {:keys [scale-factor tx-size seg-row-limit]
                                            :or {scale-factor 0.01

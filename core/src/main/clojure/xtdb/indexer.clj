@@ -5,7 +5,6 @@
             [sci.core :as sci]
             [xtdb.api :as xt]
             [xtdb.authn :as authn]
-            [xtdb.await :as await]
             [xtdb.error :as err]
             [xtdb.indexer.live-index :as li]
             [xtdb.log :as xt-log]
@@ -13,7 +12,6 @@
             [xtdb.metadata :as meta]
             [xtdb.metrics :as metrics]
             [xtdb.operator.scan :as scan]
-            [xtdb.protocols :as xtp]
             [xtdb.query :as q]
             [xtdb.rewrite :as r :refer [zmatch]]
             [xtdb.serde :as serde]
@@ -32,7 +30,6 @@
            java.nio.ByteBuffer
            (java.nio.channels ClosedByInterruptException)
            (java.time Instant ZoneId)
-           (java.util.concurrent CompletableFuture PriorityBlockingQueue TimeUnit)
            (java.util.function Consumer)
            (org.apache.arrow.memory BufferAllocator)
            (org.apache.arrow.vector.complex DenseUnionVector ListVector)
@@ -41,19 +38,17 @@
            xtdb.api.TransactionKey
            (xtdb.api.tx TxOp)
            (xtdb.arrow RowCopier)
-           (xtdb.indexer.live_index ILiveIndex ILiveIndexTx ILiveTableTx)
+           (xtdb.indexer IIndexer LiveIndex LiveIndex$Tx LiveTable$Tx OpIndexer RelationIndexer Watermark Watermark$Source)
            xtdb.metadata.IMetadataManager
            (xtdb.query IQuerySource PreparedQuery)
            xtdb.types.ClojureForm
-           (xtdb.vector IVectorReader RelationAsStructReader RelationReader SingletonListReader)
-           (xtdb.watermark IWatermarkSource Watermark)
-           (xtdb.indexer IIndexer OpIndexer RelationIndexer)))
+           (xtdb.vector IVectorReader RelationAsStructReader RelationReader SingletonListReader)))
 
 (set! *unchecked-math* :warn-on-boxed)
 
 (def ^:private abort-exn (err/runtime-err :abort-exn))
 
-(defn- ->put-docs-indexer ^xtdb.indexer.OpIndexer [^ILiveIndexTx live-idx-tx,
+(defn- ->put-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx,
                                                    ^IVectorReader tx-ops-rdr, ^Instant system-time]
   (let [put-leg (.legReader tx-ops-rdr "put-docs")
         iids-rdr (.structKeyReader put-leg "iids")
@@ -91,12 +86,12 @@
 
                                                           :docs-rdr table-docs-rdr
 
-                                                          :doc-copier (-> (.docWriter live-table)
+                                                          :doc-copier (-> (.getDocWriter live-table)
                                                                           (.rowCopier table-rel-rdr))})))))))]
 
     (reify OpIndexer
       (indexOp [_ tx-op-idx]
-        (let [{:keys [^IVectorReader docs-rdr, ^IVectorReader id-rdr, ^ILiveTableTx live-table, ^RowCopier doc-copier]}
+        (let [{:keys [^IVectorReader docs-rdr, ^IVectorReader id-rdr, ^LiveTable$Tx live-table, ^RowCopier doc-copier]}
               (get tables (.getLeg docs-rdr tx-op-idx))
 
               valid-from (if (.isNull valid-from-rdr tx-op-idx)
@@ -124,7 +119,7 @@
 
         nil))))
 
-(defn- ->delete-docs-indexer ^xtdb.indexer.OpIndexer [^ILiveIndexTx live-idx-tx, ^IVectorReader tx-ops-rdr, ^Instant current-time]
+(defn- ->delete-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr, ^Instant current-time]
   (let [delete-leg (.legReader tx-ops-rdr "delete-docs")
         table-rdr (.structKeyReader delete-leg "table")
         iids-rdr (.structKeyReader delete-leg "iids")
@@ -157,7 +152,7 @@
 
         nil))))
 
-(defn- ->erase-docs-indexer ^xtdb.indexer.OpIndexer [^ILiveIndexTx live-idx-tx, ^IVectorReader tx-ops-rdr]
+(defn- ->erase-docs-indexer ^xtdb.indexer.OpIndexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr]
   (let [erase-leg (.legReader tx-ops-rdr "erase-docs")
         table-rdr (.structKeyReader erase-leg "table")
         iids-rdr (.structKeyReader erase-leg "iids")
@@ -295,7 +290,7 @@
             (reset! !last-tx-fn-error t)
             (throw t)))))))
 
-(defn- ->upsert-rel-indexer ^xtdb.indexer.RelationIndexer [^ILiveIndexTx live-idx-tx
+(defn- ->upsert-rel-indexer ^xtdb.indexer.RelationIndexer [^LiveIndex$Tx live-idx-tx
                                                            {:keys [^Instant current-time]}]
 
   (let [current-time-µs (time/instant->micros current-time)]
@@ -314,7 +309,7 @@
               valid-to-rdr (.readerForName in-rel "_valid_to")
 
               live-idx-table (.liveTable live-idx-tx table)
-              live-idx-table-copier (-> (.docWriter live-idx-table)
+              live-idx-table-copier (-> (.getDocWriter live-idx-table)
                                         (.rowCopier content-rel))]
 
           (when-not id-col
@@ -338,7 +333,7 @@
               (when (< valid-from valid-to)
                 (.logPut live-idx-table (util/->iid eid) valid-from valid-to #(.copyRow live-idx-table-copier idx))))))))))
 
-(defn- ->delete-rel-indexer ^xtdb.indexer.RelationIndexer [^ILiveIndexTx live-idx-tx]
+(defn- ->delete-rel-indexer ^xtdb.indexer.RelationIndexer [^LiveIndex$Tx live-idx-tx]
   (reify RelationIndexer
     (indexOp [_ in-rel {:keys [table]}]
       (let [table (str table)
@@ -364,7 +359,7 @@
             (-> (.liveTable live-idx-tx table)
                 (.logDelete iid valid-from valid-to))))))))
 
-(defn- ->erase-rel-indexer ^xtdb.indexer.RelationIndexer [^ILiveIndexTx live-idx-tx]
+(defn- ->erase-rel-indexer ^xtdb.indexer.RelationIndexer [^LiveIndex$Tx live-idx-tx]
   (reify RelationIndexer
     (indexOp [_ in-rel {:keys [table]}]
       (let [table (str table)
@@ -429,9 +424,9 @@
             (aset selection 0 idx)
             (eval-query (-> param-rel (.select selection)))))))))
 
-(defn- patch-rel! [^ILiveTableTx live-table, ^RelationReader rel]
+(defn- patch-rel! [^LiveTable$Tx live-table, ^RelationReader rel]
   (let [iid-rdr (.readerForName rel "_iid")
-        doc-copier (.rowCopier (.readerForName rel "doc") (.docWriter live-table))
+        doc-copier (.rowCopier (.readerForName rel "doc") (.getDocWriter live-table))
         from-rdr (.readerForName rel "_valid_from")
         to-rdr (.readerForName rel "_valid_to")]
     (dotimes [idx (.rowCount rel)]
@@ -441,7 +436,7 @@
                (.getLong to-rdr idx)
                #(.copyRow doc-copier idx)))))
 
-(defn- ->patch-docs-indexer [^ILiveIndexTx live-idx-tx, ^IVectorReader tx-ops-rdr,
+(defn- ->patch-docs-indexer [^LiveIndex$Tx live-idx-tx, ^IVectorReader tx-ops-rdr,
                              ^IQuerySource q-src, wm-src,
                              {:keys [snapshot-time] :as tx-opts}]
   (let [patch-leg (.legReader tx-ops-rdr "patch-docs")
@@ -536,11 +531,11 @@
 
 (def ^:private ^:const ^String user-table "pg_catalog/pg_user")
 
-(defn- update-pg-user! [^ILiveIndexTx live-idx-tx, ^TransactionKey tx-key, user, password]
+(defn- update-pg-user! [^LiveIndex$Tx live-idx-tx, ^TransactionKey tx-key, user, password]
   (let [system-time-µs (time/instant->micros (.getSystemTime tx-key))
 
         live-table (.liveTable live-idx-tx user-table)
-        doc-writer (.docWriter live-table)]
+        doc-writer (.getDocWriter live-table)]
 
     (.logPut live-table (util/->iid user) system-time-µs Long/MAX_VALUE
              (fn write-doc! []
@@ -559,7 +554,7 @@
 
                (.endStruct doc-writer)))))
 
-(defn- ->sql-indexer ^xtdb.indexer.OpIndexer [^BufferAllocator allocator, ^ILiveIndexTx live-idx-tx
+(defn- ->sql-indexer ^xtdb.indexer.OpIndexer [^BufferAllocator allocator, ^LiveIndex$Tx live-idx-tx
                                               ^IVectorReader tx-ops-rdr, ^IQuerySource q-src, wm-src,
                                               {:keys [tx-key] :as tx-opts}]
   (let [sql-leg (.legReader tx-ops-rdr "sql")
@@ -636,7 +631,7 @@
          (vr/rel-reader (for [^IVectorReader col args]
                           (.withName col (str "?" (.getName col)))))))))
 
-(defn- ->xtql-indexer ^xtdb.indexer.OpIndexer [^BufferAllocator allocator, ^ILiveIndexTx live-idx-tx
+(defn- ->xtql-indexer ^xtdb.indexer.OpIndexer [^BufferAllocator allocator, ^LiveIndex$Tx live-idx-tx
                                                ^IVectorReader tx-ops-rdr, ^IQuerySource q-src, wm-src,
                                                tx-opts]
   (let [xtql-leg (.legReader tx-ops-rdr "xtql")
@@ -681,12 +676,12 @@
 
 (def ^:private ^:const ^String txs-table "xt/txs")
 
-(defn- add-tx-row! [^ILiveIndexTx live-idx-tx, ^TransactionKey tx-key, ^Throwable t]
+(defn- add-tx-row! [^LiveIndex$Tx live-idx-tx, ^TransactionKey tx-key, ^Throwable t]
   (let [tx-id (.getTxId tx-key)
         system-time-µs (time/instant->micros (.getSystemTime tx-key))
 
         live-table (.liveTable live-idx-tx txs-table)
-        doc-writer (.docWriter live-table)]
+        doc-writer (.getDocWriter live-table)]
 
     (.logPut live-table (util/->iid tx-id) system-time-µs Long/MAX_VALUE
              (fn write-doc! []
@@ -714,141 +709,108 @@
 (deftype Indexer [^BufferAllocator allocator
                   ^IMetadataManager metadata-mgr
                   ^IQuerySource q-src
-                  ^ILiveIndex live-idx
-
-                  ^:volatile-mutable indexer-error
-
-                  ^PriorityBlockingQueue awaiters
+                  ^LiveIndex live-idx
                   ^Timer tx-timer]
   IIndexer
-  (indexTx [this tx-id msg-ts tx-root]
-    (try
-      (let [lc-tx (.latestCompletedTx this)
-            default-system-time (or (when-let [lc-sys-time (some-> lc-tx (.getSystemTime))]
-                                      (when-not (neg? (compare lc-sys-time msg-ts))
-                                        (.plusNanos lc-sys-time 1000)))
-                                    msg-ts)
+  (indexTx [_ tx-id msg-ts tx-root]
+    (let [lc-tx (.getLatestCompletedTx live-idx)
+          default-system-time (or (when-let [lc-sys-time (some-> lc-tx (.getSystemTime))]
+                                    (when-not (neg? (compare lc-sys-time msg-ts))
+                                      (.plusNanos lc-sys-time 1000)))
+                                  msg-ts)
 
-            system-time (let [sys-time-vec (vr/vec->reader (.getVector tx-root "system-time"))]
-                          (some-> (.getObject sys-time-vec 0) time/->instant))]
+          system-time (let [sys-time-vec (vr/vec->reader (.getVector tx-root "system-time"))]
+                        (some-> (.getObject sys-time-vec 0) time/->instant))]
 
-        (if (and system-time lc-tx
-                 (neg? (compare system-time (.getSystemTime lc-tx))))
-          (let [tx-key (serde/->TxKey tx-id default-system-time)
-                err (err/illegal-arg :invalid-system-time
-                                     {::err/message "specified system-time older than current tx"
-                                      :tx-key (serde/->TxKey tx-id system-time)
-                                      :latest-completed-tx (.latestCompletedTx this)})]
-            (log/warnf "specified system-time '%s' older than current tx '%s'"
-                       (pr-str system-time)
-                       (pr-str (.latestCompletedTx this)))
+      (if (and system-time lc-tx
+               (neg? (compare system-time (.getSystemTime lc-tx))))
+        (let [tx-key (serde/->TxKey tx-id default-system-time)
+              err (err/illegal-arg :invalid-system-time
+                                   {::err/message "specified system-time older than current tx"
+                                    :tx-key (serde/->TxKey tx-id system-time)
+                                    :latest-completed-tx (.getLatestCompletedTx live-idx)})]
+          (log/warnf "specified system-time '%s' older than current tx '%s'"
+                     (pr-str system-time)
+                     (pr-str (.getLatestCompletedTx live-idx)))
 
-            (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
-              (add-tx-row! live-idx-tx tx-key err)
-              (.commit live-idx-tx))
+          (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
+            (add-tx-row! live-idx-tx tx-key err)
+            (.commit live-idx-tx))
 
-            (doto (serde/->tx-aborted tx-id default-system-time err)
-              (await/notify-tx awaiters)))
+          (serde/->tx-aborted tx-id default-system-time err))
 
-          (let [system-time (or system-time default-system-time)
-                tx-key (serde/->TxKey tx-id system-time)]
-            (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
-              (let [^DenseUnionVector tx-ops-vec (-> ^ListVector (.getVector tx-root "tx-ops")
-                                                     (.getDataVector))
+        (let [system-time (or system-time default-system-time)
+              tx-key (serde/->TxKey tx-id system-time)]
+          (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
+            (let [^DenseUnionVector tx-ops-vec (-> ^ListVector (.getVector tx-root "tx-ops")
+                                                   (.getDataVector))
 
-                    wm-src (reify IWatermarkSource
-                             (openWatermark [_]
-                               (util/with-close-on-catch [live-index-wm (.openWatermark live-idx-tx)]
-                                 (Watermark. nil live-index-wm
-                                             (li/->schema live-index-wm metadata-mgr)))))
+                  wm-src (reify Watermark$Source
+                           (openWatermark [_]
+                             (util/with-close-on-catch [live-index-wm (.openWatermark live-idx-tx)]
+                               (Watermark. nil live-index-wm
+                                           (li/->schema live-index-wm metadata-mgr)))))
 
-                    tx-opts {:snapshot-time system-time
-                             :current-time system-time
-                             :default-tz (ZoneId/of (str (-> (.getVector tx-root "default-tz")
-                                                             (.getObject 0))))
-                             :tx-key tx-key}]
+                  tx-opts {:snapshot-time system-time
+                           :current-time system-time
+                           :default-tz (ZoneId/of (str (-> (.getVector tx-root "default-tz")
+                                                           (.getObject 0))))
+                           :tx-key tx-key}]
 
-                (letfn [(index-tx-ops [^DenseUnionVector tx-ops-vec]
-                          (let [tx-ops-rdr (vr/vec->reader tx-ops-vec)
-                                !put-docs-idxer (delay (->put-docs-indexer live-idx-tx tx-ops-rdr system-time))
-                                !patch-docs-idxer (delay (->patch-docs-indexer live-idx-tx tx-ops-rdr q-src wm-src tx-opts))
-                                !delete-docs-idxer (delay (->delete-docs-indexer live-idx-tx tx-ops-rdr system-time))
-                                !erase-docs-idxer (delay (->erase-docs-indexer live-idx-tx tx-ops-rdr))
-                                !call-idxer (delay (->call-indexer allocator q-src wm-src tx-ops-rdr tx-opts))
-                                !xtql-idxer (delay (->xtql-indexer allocator live-idx-tx tx-ops-rdr q-src wm-src tx-opts))
-                                !sql-idxer (delay (->sql-indexer allocator live-idx-tx tx-ops-rdr q-src wm-src tx-opts))]
-                            (dotimes [tx-op-idx (.valueCount tx-ops-rdr)]
-                              (when-let [more-tx-ops
-                                         (.recordCallable tx-timer
-                                                          #(case (.getLeg tx-ops-rdr tx-op-idx)
-                                                             "xtql" (.indexOp ^OpIndexer @!xtql-idxer tx-op-idx)
-                                                             "sql" (.indexOp ^OpIndexer @!sql-idxer tx-op-idx)
-                                                             "put-docs" (.indexOp ^OpIndexer @!put-docs-idxer tx-op-idx)
-                                                             "patch-docs" (.indexOp ^OpIndexer @!patch-docs-idxer tx-op-idx)
-                                                             "delete-docs" (.indexOp ^OpIndexer @!delete-docs-idxer tx-op-idx)
-                                                             "erase-docs" (.indexOp ^OpIndexer @!erase-docs-idxer tx-op-idx)
-                                                             "call" (.indexOp ^OpIndexer @!call-idxer tx-op-idx)
-                                                             "abort" (throw abort-exn)))]
-                                (try
-                                  (index-tx-ops more-tx-ops)
-                                  (finally
-                                    (util/try-close more-tx-ops)))))))]
-                  (doto (let [e (try
-                                  (index-tx-ops tx-ops-vec)
-                                  (catch xtdb.RuntimeException e e)
-                                  (catch xtdb.IllegalArgumentException e e)
-                                  (catch ClosedByInterruptException e
-                                    (throw (InterruptedException. (.toString e))))
-                                  (catch InterruptedException e
-                                    (throw e))
-                                  (catch Throwable t
-                                    (log/error t "error in indexer, indexing" tx-key)
-                                    (throw t)))]
-                          (if e
-                            (do
-                              (when-not (= e abort-exn)
-                                (log/debug e "aborted tx")
-                                (.abort live-idx-tx))
+              (letfn [(index-tx-ops [^DenseUnionVector tx-ops-vec]
+                        (let [tx-ops-rdr (vr/vec->reader tx-ops-vec)
+                              !put-docs-idxer (delay (->put-docs-indexer live-idx-tx tx-ops-rdr system-time))
+                              !patch-docs-idxer (delay (->patch-docs-indexer live-idx-tx tx-ops-rdr q-src wm-src tx-opts))
+                              !delete-docs-idxer (delay (->delete-docs-indexer live-idx-tx tx-ops-rdr system-time))
+                              !erase-docs-idxer (delay (->erase-docs-indexer live-idx-tx tx-ops-rdr))
+                              !call-idxer (delay (->call-indexer allocator q-src wm-src tx-ops-rdr tx-opts))
+                              !xtql-idxer (delay (->xtql-indexer allocator live-idx-tx tx-ops-rdr q-src wm-src tx-opts))
+                              !sql-idxer (delay (->sql-indexer allocator live-idx-tx tx-ops-rdr q-src wm-src tx-opts))]
+                          (dotimes [tx-op-idx (.valueCount tx-ops-rdr)]
+                            (when-let [more-tx-ops
+                                       (.recordCallable tx-timer
+                                                        #(case (.getLeg tx-ops-rdr tx-op-idx)
+                                                           "xtql" (.indexOp ^OpIndexer @!xtql-idxer tx-op-idx)
+                                                           "sql" (.indexOp ^OpIndexer @!sql-idxer tx-op-idx)
+                                                           "put-docs" (.indexOp ^OpIndexer @!put-docs-idxer tx-op-idx)
+                                                           "patch-docs" (.indexOp ^OpIndexer @!patch-docs-idxer tx-op-idx)
+                                                           "delete-docs" (.indexOp ^OpIndexer @!delete-docs-idxer tx-op-idx)
+                                                           "erase-docs" (.indexOp ^OpIndexer @!erase-docs-idxer tx-op-idx)
+                                                           "call" (.indexOp ^OpIndexer @!call-idxer tx-op-idx)
+                                                           "abort" (throw abort-exn)))]
+                              (try
+                                (index-tx-ops more-tx-ops)
+                                (finally
+                                  (util/try-close more-tx-ops)))))))]
+                (let [e (try
+                          (index-tx-ops tx-ops-vec)
+                          (catch xtdb.RuntimeException e e)
+                          (catch xtdb.IllegalArgumentException e e)
+                          (catch ClosedByInterruptException e
+                            (throw (InterruptedException. (.toString e))))
+                          (catch InterruptedException e
+                            (throw e))
+                          (catch Throwable t
+                            (log/error t "error in indexer, indexing" tx-key)
+                            (throw t)))]
+                  (if e
+                    (do
+                      (when-not (= e abort-exn)
+                        (log/debug e "aborted tx")
+                        (.abort live-idx-tx))
 
-                              (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
-                                (add-tx-row! live-idx-tx tx-key e)
-                                (.commit live-idx-tx))
+                      (util/with-open [live-idx-tx (.startTx live-idx tx-key)]
+                        (add-tx-row! live-idx-tx tx-key e)
+                        (.commit live-idx-tx))
 
-                              (serde/->tx-aborted tx-id system-time
-                                                  (when-not (= e abort-exn)
-                                                    e)))
+                      (serde/->tx-aborted tx-id system-time
+                                          (when-not (= e abort-exn)
+                                            e)))
 
-                            (do
-                              (add-tx-row! live-idx-tx tx-key nil)
-                              (.commit live-idx-tx)
-                              (serde/->tx-committed tx-id system-time))))
-
-                    (await/notify-tx awaiters))))))))
-
-      (catch Throwable t
-        (set! (.indexer-error this) t)
-        (await/notify-ex t awaiters)
-        (throw t))))
-
-  (forceFlush [_ tx-key expected-last-chunk-tx-id]
-    (li/force-flush! live-idx tx-key expected-last-chunk-tx-id))
-
-  IWatermarkSource
-  (openWatermark [_] (.openWatermark live-idx))
-
-  (latestCompletedTx [_] (.latestCompletedTx live-idx))
-  (latestCompletedChunkTx [_] (.latestCompletedChunkTx live-idx))
-
-  (awaitTx [this tx-id timeout]
-    @(-> (if tx-id
-           (await/await-tx-async tx-id
-                                 #(or (some-> (.indexer-error this) throw)
-                                      (.latestCompletedTx this))
-                                 awaiters)
-           (CompletableFuture/completedFuture (.latestCompletedTx this)))
-         (cond-> timeout (.orTimeout (.toMillis timeout) TimeUnit/MILLISECONDS))))
-
-  (indexerError [this] (.indexer-error this))
+                    (do
+                      (add-tx-row! live-idx-tx tx-key nil)
+                      (.commit live-idx-tx)
+                      (serde/->tx-committed tx-id system-time)))))))))))
 
   Closeable
   (close [_]
@@ -867,16 +829,8 @@
     (metrics/add-allocator-gauge metrics-registry "indexer.allocator.allocated_memory" allocator)
     (->Indexer allocator metadata-mgr q-src live-index
 
-               nil ;; indexer-error
-
-               (PriorityBlockingQueue.)
                (metrics/add-timer metrics-registry "tx.op.timer"
                                   {:description "indicates the timing and number of transactions"}))))
 
 (defmethod ig/halt-key! :xtdb/indexer [_ indexer]
   (util/close indexer))
-
-(defn await-tx
-  ([node] (await-tx (xtp/latest-submitted-tx-id node) node))
-  ([^long tx-id node] (await-tx tx-id node nil))
-  ([^long tx-id node timeout] (.awaitTx ^IIndexer (util/component node :xtdb/indexer) tx-id timeout)))

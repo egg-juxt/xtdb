@@ -44,6 +44,15 @@ val twelveGBJvmArgs = listOf(
 
 java.toolchain.languageVersion.set(JavaLanguageVersion.of(21))
 
+val buildEnv="standard"
+
+layout.buildDirectory.set(
+    when (buildEnv) {
+        "repl" -> layout.projectDirectory.dir("buildRepl")
+        else -> layout.projectDirectory.dir("build")
+    }
+)
+
 allprojects {
     val proj = this
 
@@ -82,14 +91,22 @@ allprojects {
             // To stub an AWS region
             environment("AWS_REGION", "eu-west-1")
             useJUnitPlatform {
-                excludeTags("integration", "kafka", "jdbc", "timescale", "s3", "minio", "slt", "docker", "azure", "google-cloud")
+                excludeTags("integration", "jdbc", "timescale", "s3", "minio", "slt", "docker", "azure", "google-cloud")
             }
+
+            /*
+              // this one logs every test start/finish - useful if there's a hanging test
+              testLogging {
+                  events("started", "passed", "skipped", "failed")
+              }
+            */
+
         }
 
         tasks.register("integration-test", Test::class) {
             jvmArgs(defaultJvmArgs + twelveGBJvmArgs)
             useJUnitPlatform {
-                includeTags("integration", "kafka")
+                includeTags("integration")
             }
         }
 
@@ -126,6 +143,10 @@ allprojects {
             }
 
             tasks.clojureRepl {
+                doFirst {
+                    project.ext.set("buildEnv", "repl")
+                }
+
                 forkOptions.run {
                     val jvmArgs = defaultJvmArgs.toMutableList()
 
@@ -257,7 +278,7 @@ dependencies {
 
     projectDep(":modules:bench")
     projectDep(":modules:c1-import")
-    projectDep(":modules:datasets")
+    projectDep(":modules:xtdb-datasets")
     projectDep(":modules:xtdb-flight-sql")
     projectDep(":modules:xtdb-kafka-connect")
     projectDep(":cloud-benchmark")
@@ -294,10 +315,19 @@ dependencies {
     // For generating clojure docs
     testImplementation("codox", "codox", "0.10.8")
 
+    implementation(libs.kotlinx.coroutines)
+    testImplementation(libs.kotlinx.coroutines.test)
+    implementation(kotlin("stdlib-jdk8"))
+    testImplementation(kotlin("test"))
+    testImplementation(kotlin("test-junit5"))
+
     // for AWS profiles (managing datasets)
     devImplementation("software.amazon.awssdk", "sts", "2.16.76")
     devImplementation("software.amazon.awssdk", "sso", "2.16.76")
     devImplementation("software.amazon.awssdk", "ssooidc", "2.16.76")
+
+    testImplementation("org.testcontainers", "minio", "1.20.0")
+    testImplementation("io.minio", "minio", "8.5.17")
 
     devImplementation("com.taoensso", "nippy", "3.3.0")
     testImplementation("com.taoensso", "nippy", "3.3.0")

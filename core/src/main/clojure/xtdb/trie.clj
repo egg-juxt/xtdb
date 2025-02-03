@@ -14,7 +14,7 @@
            (org.apache.arrow.vector.types.pojo ArrowType$Union Field Schema)
            org.apache.arrow.vector.types.UnionMode
            (xtdb.arrow Relation)
-           xtdb.IBufferPool
+           xtdb.BufferPool
            (xtdb.trie ArrowHashTrie$Leaf HashTrie$Node ISegment MemoryHashTrie MemoryHashTrie$Leaf MergePlanNode TrieWriter)
            (xtdb.util TemporalBounds)))
 
@@ -35,14 +35,22 @@
           (str/join part)
           (util/->lex-hex-string next-row)))
 
-(defn ->table-data-file-path [^Path table-path trie-key]
-  (.resolve table-path (format "data/%s.arrow" trie-key)))
+(def ^java.nio.file.Path tables-dir (util/->path "tables"))
 
-(defn ->table-meta-file-path [^Path table-path trie-key]
-  (.resolve table-path (format "meta/%s.arrow" trie-key)))
+(defn- table-name->table-path ^java.nio.file.Path [^String table-name]
+  (.resolve tables-dir (-> table-name (str/replace #"[\.\/]" "\\$"))))
 
-(defn list-meta-files [^IBufferPool buffer-pool ^Path table-path]
-  (.listObjects buffer-pool (.resolve table-path "meta")))
+(defn ->table-data-file-path ^java.nio.file.Path [table-name trie-key]
+  (-> (table-name->table-path table-name)
+      (.resolve (format "data/%s.arrow" trie-key))))
+
+(defn ->table-meta-dir ^java.nio.file.Path [table-name]
+  (-> (table-name->table-path table-name)
+      (.resolve "meta")))
+
+(defn ->table-meta-file-path [table-name trie-key]
+  (-> (->table-meta-dir table-name)
+      (.resolve (format "%s.arrow" trie-key))))
 
 (def ^org.apache.arrow.vector.types.pojo.Schema meta-rel-schema
   (Schema. [(types/->field "nodes" (ArrowType$Union. UnionMode/Dense (int-array (range 4))) false
@@ -74,11 +82,11 @@
    (util/with-close-on-catch [root (VectorSchemaRoot/create data-schema allocator)]
      (vw/root->writer root))))
 
-(defn open-trie-writer ^TrieWriter [^BufferAllocator allocator, ^IBufferPool buffer-pool,
-                                    ^Schema data-schema, ^Path table-path, trie-key
+(defn open-trie-writer ^TrieWriter [^BufferAllocator allocator, ^BufferPool buffer-pool,
+                                    ^Schema data-schema, table-name, trie-key
                                     write-content-metadata?]
   (util/with-close-on-catch [data-rel (Relation. allocator data-schema)
-                             data-file-wtr (.openArrowWriter buffer-pool (->table-data-file-path table-path trie-key) data-rel)
+                             data-file-wtr (.openArrowWriter buffer-pool (->table-data-file-path table-name trie-key) data-rel)
                              meta-rel (Relation. allocator meta-rel-schema)]
 
     (let [node-wtr (.get meta-rel "nodes")
@@ -149,11 +157,13 @@
             pos))
 
         (end [_]
-          (.end data-file-wtr)
+          (let [data-file-size (.end data-file-wtr)]
 
-          (util/with-open [meta-file-wtr (.openArrowWriter buffer-pool (->table-meta-file-path table-path trie-key) meta-rel)]
-            (.writeBatch meta-file-wtr)
-            (.end meta-file-wtr)))
+            (util/with-open [meta-file-wtr (.openArrowWriter buffer-pool (->table-meta-file-path table-name trie-key) meta-rel)]
+              (.writeBatch meta-file-wtr)
+              (.end meta-file-wtr))
+
+            data-file-size))
 
         AutoCloseable
         (close [_]
@@ -183,10 +193,10 @@
 
       (write-node! node))))
 
-(defn write-live-trie! [^BufferAllocator allocator, ^IBufferPool buffer-pool,
-                        ^Path table-path, trie-key,
+(defn write-live-trie! [^BufferAllocator allocator, ^BufferPool buffer-pool,
+                        table-name, trie-key,
                         ^MemoryHashTrie trie, ^Relation data-rel]
-  (util/with-open [trie-wtr (open-trie-writer allocator buffer-pool (.getSchema data-rel) table-path trie-key
+  (util/with-open [trie-wtr (open-trie-writer allocator buffer-pool (.getSchema data-rel) table-name trie-key
                                               false)]
     (let [trie (.compactLogs trie)]
       (write-live-trie-node trie-wtr (.getRootNode trie) data-rel)
@@ -195,127 +205,27 @@
 
 (def ^:private trie-file-path-regex
   ;; e.g. `log-l01-fr0-nr12e-rs20.arrow` or `log-l04-p0010-nr12e.arrow`
-  #"(log-l(\p{XDigit}+)(?:-p(\p{XDigit}+))?(?:-fr(\p{XDigit}+))?-nr(\p{XDigit}+)(?:-rs(\p{XDigit}+))?)\.arrow$")
+  #"(log-l(\p{XDigit}+)(?:-p(\p{XDigit}+))?(?:-fr(\p{XDigit}+))?-nr(\p{XDigit}+)(?:-rs(\p{XDigit}+))?)(\.arrow)?$")
+
+(defn parse-trie-key [trie-key]
+  (when-let [[_ trie-key level-str part-str first-row next-row-str rows-str] (re-find trie-file-path-regex trie-key)]
+    (cond-> {:trie-key trie-key
+             :level (util/<-lex-hex-string level-str)
+             :next-row (util/<-lex-hex-string next-row-str)}
+      first-row (assoc :first-row (util/<-lex-hex-string first-row))
+      part-str (assoc :part (byte-array (map #(Character/digit ^char % 4) part-str)))
+      rows-str (assoc :rows (Long/parseLong rows-str 16)))))
 
 (defn parse-trie-file-path [^Path file-path]
-  (let [trie-key (str (.getFileName file-path))]
-    (when-let [[_ trie-key level-str part-str first-row next-row-str rows-str] (re-find trie-file-path-regex trie-key)]
-      (cond-> {:file-path file-path
-               :trie-key trie-key
-               :level (util/<-lex-hex-string level-str)
-               :next-row (util/<-lex-hex-string next-row-str)}
-        first-row (assoc :first-row (util/<-lex-hex-string first-row))
-        part-str (assoc :part (byte-array (map #(Character/digit ^char % 4) part-str)))
-        rows-str (assoc :rows (Long/parseLong rows-str 16))))))
-
-(defn path-array
-  "path-arrays are a flattened array containing one element for every possible path at the given level.
-   e.g. for L3, the path array has 16 elements; path [1 3] can be found at element 13r4 = 7.
-
-   returns :: path-array for the given level with all elements initialised to -1"
-  ^longs [^long level]
-  {:pre [(>= level 1)]}
-
-  (doto (long-array (bit-shift-left 1 (* 2 (dec level))))
-    (Arrays/fill -1)))
-
-(defn path-array-idx
-  "returns the idx for the given path in the flattened path array.
-   in effect, returns the path as a base-4 number"
-  (^long [^bytes path] (path-array-idx path (alength path)))
-
-  (^long [^bytes path, ^long len]
-   (loop [idx 0
-          res 0]
-     (if (= idx len)
-       res
-       (recur (inc idx)
-              (+ (* res 4) (aget path idx)))))))
-
-(defn rows-covered-below
-  "This function returns the row for each path that L<n> has completely covered.
-   e.g. if L<n> has paths 0130, 0131, 0132 and 0133 covered to a minimum of row 384,
-        then everything in L<n-1> for path 013 is covered for row <= 384.
-
-   covered-rows :: a path-array for the maximum written row for each path at L<n>
-   returns :: a path-array of the covered row for every path at L<n-1>"
-
-  ^longs [^longs covered-rows]
-
-  (let [out-len (/ (alength covered-rows) 4)
-        res (doto (long-array out-len)
-              (Arrays/fill -1))]
-    (dotimes [n out-len]
-      (let [start-idx (* n 4)]
-        (aset res n (-> (aget covered-rows start-idx)
-                        (min (aget covered-rows (+ start-idx 1)))
-                        (min (aget covered-rows (+ start-idx 2)))
-                        (min (aget covered-rows (+ start-idx 3)))))))
-    res))
-
-(defn- file-names->level-groups [file-names]
-  (->> file-names
-       (keep parse-trie-file-path)
-       (group-by :level)))
-
-(defn current-trie-files [file-names]
-  (when (seq file-names)
-    (let [!current-trie-keys (ArrayList.)
-
-          {l0-trie-keys 0, l1-trie-keys 1, :as level-grouped-file-names} (file-names->level-groups file-names)
-
-          ;; filtering superseded L1 files
-          l1-trie-keys (into [] (comp (partition-by :first-row) (map last)) l1-trie-keys)
-
-          max-level (long (last (sort (keys level-grouped-file-names))))
-
-          ^long l2+-covered-row (if (<= max-level 1)
-                                  -1
-
-                                  (loop [level max-level
-                                         ^longs !covered-rows (path-array level)]
-                                    (let [lvl-trie-keys (get level-grouped-file-names level)
-                                          _ (assert (= lvl-trie-keys (seq (sort-by :file-path lvl-trie-keys)))
-                                                    "lvl-trie-keys not sorted")
-
-                                          uncovered-lvl-trie-keys (->> lvl-trie-keys
-                                                                       ;; eager because we're mutating `!covered-rows`
-                                                                       (filterv (fn not-covered-above [{:keys [part ^long next-row]}]
-                                                                                  (let [idx (path-array-idx part)]
-                                                                                    (when (> next-row (aget !covered-rows idx))
-                                                                                      (aset !covered-rows idx next-row)
-                                                                                      true)))))
-
-                                          !covered-below (rows-covered-below !covered-rows)]
-
-                                      ;; when the whole path-set is covered below, this is a current file
-                                      (doseq [{:keys [^bytes part, ^long next-row] :as trie-key} uncovered-lvl-trie-keys
-                                              :when (>= (aget !covered-below (path-array-idx part (dec (alength part)))) next-row)]
-                                        (.add !current-trie-keys trie-key))
-
-                                      (if (= level 2)
-                                        (aget !covered-below 0)
-                                        (recur (dec level) !covered-below)))))
-
-          l1-covered-row (long (or (last (for [{:keys [^long next-row] :as trie-key} l1-trie-keys
-                                               :when (< l2+-covered-row next-row)]
-                                           (do
-                                             (.add !current-trie-keys trie-key)
-                                             next-row)))
-                                   l2+-covered-row))]
-
-      (doseq [{:keys [^long next-row] :as trie-key} l0-trie-keys
-              :when (< l1-covered-row next-row)]
-        (.add !current-trie-keys trie-key))
-
-      (mapv :file-path !current-trie-keys))))
+  (-> (parse-trie-key (str (.getFileName file-path)))
+      (assoc :file-path file-path)))
 
 (defrecord Segment [trie]
   ISegment
   (getTrie [_] trie))
 
 (defprotocol MergePlanPage
-  (load-page [mpg ^IBufferPool buffer-pool vsr-cache])
+  (load-page [mpg ^BufferPool buffer-pool vsr-cache])
   (test-metadata [msg])
   (temporal-bounds [msg]))
 
@@ -378,7 +288,7 @@
   (^org.apache.arrow.vector.types.pojo.Schema getSchema [])
   (^xtdb.arrow.RelationReader loadPage [trie-leaf]))
 
-(deftype ArrowDataRel [^IBufferPool buffer-pool
+(deftype ArrowDataRel [^BufferPool buffer-pool
                        ^Path data-file
                        ^Schema schema
                        ^List rels-to-close]
@@ -396,10 +306,10 @@
   (close [_]
     (util/close rels-to-close)))
 
-(defn open-data-rels [^IBufferPool buffer-pool, ^Path table-path, trie-keys]
+(defn open-data-rels [^BufferPool buffer-pool, table-name, trie-keys]
   (util/with-close-on-catch [data-rels (ArrayList.)]
     (doseq [trie-key trie-keys]
-      (let [data-file (->table-data-file-path table-path trie-key)
+      (let [data-file (->table-data-file-path table-name trie-key)
             footer (.getFooter buffer-pool data-file)]
         (.add data-rels (ArrowDataRel. buffer-pool data-file (.getSchema footer) (ArrayList.)))))
     (vec data-rels)))

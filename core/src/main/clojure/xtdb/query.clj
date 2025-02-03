@@ -30,8 +30,8 @@
             [xtdb.util :as util]
             [xtdb.vector.reader :as vr]
             [xtdb.vector.writer :as vw]
-            [xtdb.xtql.plan :as xtql.plan]
-            [xtdb.xtql :as xtql])
+            [xtdb.xtql :as xtql]
+            [xtdb.xtql.plan :as xtql.plan])
   (:import clojure.lang.MapEntry
            (com.github.benmanes.caffeine.cache Cache Caffeine)
            java.lang.AutoCloseable
@@ -45,11 +45,11 @@
            (xtdb ICursor IResultCursor)
            (xtdb.antlr Sql$DirectlyExecutableStatementContext)
            (xtdb.api.query IKeyFn Query)
+           (xtdb.indexer Watermark$Source)
            xtdb.metadata.IMetadataManager
            xtdb.operator.scan.IScanEmitter
            xtdb.util.RefCounter
-           xtdb.vector.IVectorReader
-           xtdb.watermark.IWatermarkSource))
+           xtdb.vector.IVectorReader))
 
 #_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
 (definterface BoundQuery
@@ -73,7 +73,10 @@
 
 #_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
 (definterface IQuerySource
+  (^xtdb.query.PreparedQuery prepareRaQuery [ra-query query-opts])
   (^xtdb.query.PreparedQuery prepareRaQuery [ra-query wm-src query-opts])
+
+  (^clojure.lang.PersistentVector planQuery [query query-opts])
   (^clojure.lang.PersistentVector planQuery [query wm-src query-opts]))
 
 (defn- wrap-cursor ^xtdb.IResultCursor [^ICursor cursor, ^AutoCloseable wm, ^BufferAllocator al,
@@ -101,7 +104,7 @@
 
     (columnFields [_] fields)))
 
-(defn emit-expr [^ConcurrentHashMap cache {:keys [^IScanEmitter scan-emitter, ^IMetadataManager metadata-mgr, ^IWatermarkSource wm-src]}
+(defn emit-expr [^ConcurrentHashMap cache {:keys [^IScanEmitter scan-emitter, ^IMetadataManager metadata-mgr, ^Watermark$Source wm-src]}
                  conformed-query scan-cols default-tz param-fields]
   (.computeIfAbsent cache
                     {:scan-fields (when (and (seq scan-cols) scan-emitter)
@@ -137,7 +140,7 @@
 
   (^xtdb.query.PreparedQuery [query
                               {:keys [^IScanEmitter scan-emitter, ^BufferAllocator allocator,
-                                      ^RefCounter ref-ctr ^IWatermarkSource wm-src] :as deps}
+                                      ^RefCounter ref-ctr ^Watermark$Source wm-src] :as deps}
                               {:keys [param-types default-tz table-info]}]
 
    (let [conformed-query (s/conform ::lp/logical-plan query)]
@@ -221,7 +224,7 @@
                        (-> (->cursor {:allocator allocator, :watermark wm
                                       :clock clock,
                                       :default-tz default-tz,
-                                      :snapshot-time (or snapshot-time (some-> wm .txBasis .getSystemTime))
+                                      :snapshot-time (or snapshot-time (some-> wm .getTxBasis .getSystemTime))
                                       :current-time current-time
                                       :args (or args vw/empty-args)
                                       :schema (scan/tables-with-cols wm-src)})
@@ -242,19 +245,26 @@
           :plan-cache-size 1000
           :allocator (ig/ref :xtdb/allocator)
           :scan-emitter (ig/ref ::scan/scan-emitter)
-          :metadata-mgr (ig/ref ::meta/metadata-manager)}))
+          :metadata-mgr (ig/ref ::meta/metadata-manager)
+          :live-idx (ig/ref :xtdb.indexer/live-index)}))
 
 (defn ->caffeine-cache ^com.github.benmanes.caffeine.cache.Cache [size]
   (-> (Caffeine/newBuilder) (.maximumSize size) (.build)))
 
-(defmethod ig/init-key ::query-source [_ {:keys [plan-cache-size] :as deps}]
+(defmethod ig/init-key ::query-source [_ {:keys [plan-cache-size live-idx] :as deps}]
   (let [plan-cache (->caffeine-cache plan-cache-size)
         ref-ctr (RefCounter.)
         deps (-> deps (assoc :ref-ctr ref-ctr))]
     (reify
       IQuerySource
+      (prepareRaQuery [this query query-opts]
+        (.prepareRaQuery this query live-idx query-opts))
       (prepareRaQuery [_ query wm-src query-opts]
         (prepare-ra query (assoc deps :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src))))
+
+      (planQuery [this query query-opts]
+        (.planQuery this query live-idx query-opts))
+
       (planQuery [_ query wm-src query-opts]
         (let [table-info (scan/tables-with-cols wm-src)
               plan-query-opts

@@ -3,7 +3,7 @@ import xtdb.DataReaderTransformer
 plugins {
     java
     application
-    id("com.github.johnrengelman.shadow")
+    id("com.gradleup.shadow")
 }
 
 dependencies {
@@ -20,6 +20,7 @@ tasks.shadowJar {
     archiveBaseName.set("xtdb")
     archiveVersion.set("")
     archiveClassifier.set("local-auctionmark")
+    setProperty("zip64", true)
     mergeServiceFiles()
     transform(DataReaderTransformer())
 }

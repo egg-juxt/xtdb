@@ -25,7 +25,11 @@ dependencies {
     api(project(":xtdb-api"))
     api(project(":xtdb-core"))
 
-    api("org.apache.kafka", "kafka-clients", "3.1.0")
+    api("org.apache.kafka", "kafka-clients", "3.9.0")
 
     api(kotlin("stdlib-jdk8"))
+    testImplementation(libs.mockk)
+
+    implementation(libs.kotlinx.coroutines)
+    testImplementation(libs.kotlinx.coroutines.test)
 }

@@ -1,16 +1,22 @@
 package xtdb.buffer_pool
 
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.vector.ipc.message.ArrowFooter
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
-import xtdb.IBufferPool
+import xtdb.BufferPool
 import xtdb.IEvictBufferTest
-import xtdb.arrow.ArrowUtil.arrowBufToByteArray
+import xtdb.api.storage.ObjectStore.StoredObject
+import xtdb.api.storage.Storage.openStorageChildAllocator
+import xtdb.api.storage.Storage.registerMetrics
+import xtdb.arrow.ArrowUtil.openArrowBufView
 import xtdb.arrow.ArrowUtil.readArrowFooter
-import xtdb.arrow.ArrowUtil.toArrowBufView
 import xtdb.arrow.ArrowUtil.toArrowRecordBatchView
+import xtdb.arrow.ArrowUtil.toByteArray
 import xtdb.arrow.Relation
+import xtdb.trie.FileSize
 import xtdb.util.closeOnCatch
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
@@ -19,9 +25,13 @@ import java.nio.file.Path
 import java.util.*
 
 class MemoryBufferPool(
-    private val allocator: BufferAllocator,
+    allocator: BufferAllocator,
+    meterRegistry: MeterRegistry = SimpleMeterRegistry()
+) : BufferPool, IEvictBufferTest {
+
+    private val allocator = allocator.openStorageChildAllocator().also { it.registerMetrics(meterRegistry) }
+
     private val memoryStore: NavigableMap<Path, ArrowBuf> = TreeMap()
-) : IBufferPool, IEvictBufferTest {
 
     companion object {
         private fun objectMissingException(path: Path) = IllegalStateException("Object $path doesn't exist.")
@@ -30,19 +40,19 @@ class MemoryBufferPool(
     }
 
     override fun getByteArray(key: Path): ByteArray =
-        arrowBufToByteArray(memoryStore.lockAndGet(key) ?: throw objectMissingException(key))
+        (memoryStore.lockAndGet(key) ?: throw objectMissingException(key)).toByteArray()
 
     override fun getFooter(key: Path): ArrowFooter =
-        readArrowFooter(memoryStore.lockAndGet(key) ?: throw objectMissingException(key))
+        (memoryStore.lockAndGet(key) ?: throw objectMissingException(key)).readArrowFooter()
 
     override fun getRecordBatch(key: Path, blockIdx: Int): ArrowRecordBatch {
         try {
             val arrowBuf = memoryStore.lockAndGet(key) ?: throw objectMissingException(key)
 
-            val block = readArrowFooter(arrowBuf).recordBatches.getOrNull(blockIdx)
+            val block = arrowBuf.readArrowFooter().recordBatches.getOrNull(blockIdx)
                 ?: throw IndexOutOfBoundsException("Record batch index out of bounds of arrow file")
 
-            return toArrowRecordBatchView(block, arrowBuf)
+            return arrowBuf.toArrowRecordBatchView(block)
         } catch (e: Exception) {
             throw IllegalStateException("Failed opening record batch '$key'", e)
         }
@@ -50,25 +60,21 @@ class MemoryBufferPool(
 
     override fun putObject(key: Path, buffer: ByteBuffer) {
         synchronized(memoryStore) {
-            memoryStore[key] = toArrowBufView(allocator, buffer)
+            memoryStore[key] = buffer.openArrowBufView(allocator)
         }
     }
 
-    override fun listAllObjects(): List<Path> =
+    override fun listAllObjects() =
         synchronized(memoryStore) {
-            memoryStore.keys.toList()
+            memoryStore.entries.map { StoredObject(it.key, it.value.capacity()) }
         }
 
-    override fun listObjects(dir: Path): List<Path>  =
+    override fun listAllObjects(dir: Path) =
         synchronized(memoryStore) {
-            val dirDepth = dir.nameCount
-            memoryStore.tailMap(dir).keys
-                .takeWhile { it.startsWith(dir) }
-                .mapNotNull { path -> if (path.nameCount > dirDepth) path.subpath(0, dirDepth + 1) else null }
-                .distinct()
+            memoryStore.tailMap(dir).entries
+                .takeWhile { it.key.startsWith(dir) }
+                .map { StoredObject(it.key, it.value.capacity()) }
         }
-
-    override fun objectSize(key: Path): Long = memoryStore[key]?.capacity() ?: 0
 
     override fun openArrowWriter(key: Path, rel: Relation): xtdb.ArrowWriter {
         val baos = ByteArrayOutputStream()
@@ -79,10 +85,12 @@ class MemoryBufferPool(
                         unloader.writeBatch()
                     }
 
-                    override fun end() {
+                    override fun end(): FileSize {
                         unloader.end()
                         writeChannel.close()
-                        putObject(key, ByteBuffer.wrap(baos.toByteArray()))
+                        val bytes = baos.toByteArray()
+                        putObject(key, ByteBuffer.wrap(bytes))
+                        return bytes.size.toLong()
                     }
 
                     override fun close() {

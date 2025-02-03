@@ -1,21 +1,52 @@
 package xtdb.buffer_pool
 
+import org.apache.arrow.memory.RootAllocator
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
-import xtdb.IBufferPool
+import xtdb.BufferPool
+import xtdb.api.storage.ObjectStore.StoredObject
+import xtdb.arrow.IntVector
+import xtdb.arrow.Relation
+import xtdb.util.asPath
 import java.nio.ByteBuffer
-import java.nio.file.Path
 
 abstract class BufferPoolTest {
-    abstract fun bufferPool() : IBufferPool
+    abstract fun bufferPool(): BufferPool
 
     @Test
     fun listObjectTests_3545() {
-        val bufferPool = bufferPool()
-        bufferPool.putObject(Path.of("a/b/c"), ByteBuffer.wrap(ByteArray(10)))
-        bufferPool.putObject(Path.of("a/b/d"), ByteBuffer.wrap(ByteArray(10)))
-        bufferPool.putObject(Path.of("a/e"), ByteBuffer.wrap(ByteArray(10)))
+        val bufferPool = bufferPool().apply {
+            putObject("a/b/c".asPath, ByteBuffer.wrap(ByteArray(10)))
+            putObject("a/b/d".asPath, ByteBuffer.wrap(ByteArray(10)))
+            putObject("a/e".asPath, ByteBuffer.wrap(ByteArray(10)))
+        }
 
-        assertEquals(listOf(Path.of("a/b"), Path.of("a/e")), bufferPool.listObjects(Path.of("a")))
+        Thread.sleep(100)
+
+        fun storedObj(path: String) = StoredObject(path.asPath, 10)
+
+        assertEquals(
+            listOf(storedObj("a/b/c"), storedObj("a/b/d"), storedObj("a/e")),
+            bufferPool.listAllObjects("a".asPath)
+        )
+        assertEquals(
+            listOf(storedObj("a/b/c"), storedObj("a/b/d")),
+            bufferPool.listAllObjects("a/b".asPath)
+        )
+    }
+
+    @Test
+    fun testArrowFileSize() {
+        val bp = bufferPool()
+        RootAllocator().use { al ->
+            IntVector(al, "foo", false).use { fooVec ->
+                fooVec.apply { writeInt(10); writeInt(42); writeInt(15) }
+                val relation = Relation(listOf(fooVec), fooVec.valueCount)
+                bp.openArrowWriter("foo".asPath, relation).use { writer ->
+                    writer.writeBatch()
+                    assertEquals(534, writer.end())
+                }
+            }
+        }
     }
 }

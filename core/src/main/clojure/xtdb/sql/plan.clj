@@ -635,10 +635,12 @@
                    (.accept (->ExprPlanVisitor env (or left-scope scope))))
 
           table-projection (->table-projection (.tableProjection ctx))
-          table-alias (identifier-sym (.tableAlias ctx))]
+          table-alias (identifier-sym (.tableAlias ctx))
+          with-ordinality? (boolean (.withOrdinality ctx))]
 
       (assert (or (nil? table-projection)
-                  (= 1 (count table-projection))))
+                  (= (+ 1 (if with-ordinality? 1 0))
+                     (count table-projection))))
 
       (->UnnestTable env table-alias
                      (symbol (str table-alias "." (swap! !id-count inc)))
@@ -646,7 +648,10 @@
                          (-> (->col-sym (str "_genseries." (swap! !id-count inc)))
                              (vary-meta assoc :unnamed-unnest-col? true)))
                      expr
-                     nil)))
+                     (when with-ordinality?
+                       (or (->col-sym (second table-projection))
+                           (-> (->col-sym (str "_ordinal." (swap! !id-count inc)))
+                               (vary-meta assoc :unnamed-unnest-col? true)))))))
 
   (visitWrappedTableReference [this ctx] (-> (.tableReference ctx) (.accept this)))
 
@@ -683,6 +688,7 @@
     (let [sl-ctx (.selectList ctx)
           !subqs (HashMap.)
           !aggs (HashMap.)
+          !agg-subqs (HashMap.)
           !windows (HashMap.)
 
           explicitly-projected-cols (->> (.selectSublist sl-ctx)
@@ -693,7 +699,7 @@
                                                                       (visitDerivedColumn [_ ctx]
                                                                         (let [expr-ctx (.expr ctx)]
                                                                           [(let [expr (.accept expr-ctx
-                                                                                               (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs, :!aggs !aggs :!windows !windows}))]
+                                                                                               (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs, :!aggs !aggs :!agg-subqs !agg-subqs :!windows !windows}))]
                                                                              (if-let [as-clause (.asClause ctx)]
                                                                                (let [col-name (->col-sym (identifier-sym as-clause))]
                                                                                  (->ProjectedCol {col-name expr} col-name))
@@ -747,6 +753,7 @@
 
                                     explicitly-projected-cols))
        :subqs (not-empty (into {} !subqs))
+       :agg-subqs (not-empty (into {} !agg-subqs))
        :aggs (not-empty (into {} !aggs))
        :windows (not-empty (into {} !windows))})))
 
@@ -1461,6 +1468,11 @@
   (visitPgExpandArrayFunction [_ _] nil)
   (visitPgGetExprFunction [_ _] nil)
   (visitPgGetIndexdefFunction [_ _] nil)
+  (visitPgSleepFunction [this ctx]
+    (list 'sleep (list 'cast (.accept (.sleepSeconds ctx) this) [:duration :milli])))
+
+  (visitPgSleepForFunction [this ctx]
+    (list 'sleep (list 'cast (.accept (.sleepPeriod ctx) this) [:duration :milli])))
 
   (visitCurrentDateFunction [_ _] '(current-date))
   (visitCurrentTimeFunction [_ ctx] (fn-with-precision 'current-time (.precision ctx)))
@@ -1633,11 +1645,11 @@
     (let [ve (-> (.exprPrimary ctx) (.accept this))
           data-type (-> (.dataType ctx) (.accept (->CastArgsVisitor env)))]
       (handle-cast-expr ve data-type)))
-  
-  (visitAggregateFunctionExpr [{:keys [!aggs] :as this} ctx]
+
+  (visitAggregateFunctionExpr [{:keys [!aggs !agg-subqs] :as this} ctx]
     (if-not !aggs
       (add-err! env (->AggregatesDisallowed))
-      (-> (.aggregateFunction ctx) (.accept this))))
+      (-> (.aggregateFunction ctx) (.accept (assoc this :!subqs !agg-subqs)))))
 
   (visitCountStarFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs]} _ctx]
     (let [agg-sym (-> (->col-sym (str "_row_count_" (swap! !id-count inc)))
@@ -1834,7 +1846,15 @@
               (when (= schema-name 'xt)
                 'xtdb/xtdb-server-version))
             'xtdb/postgres-server-version)
-        (vary-meta assoc :identifier (->col-sym 'version)))))
+        (vary-meta assoc :identifier (->col-sym 'version))))
+
+  (visitPostgresTableIsVisibleFunction [_ _ctx]
+    ;; FIXME - when we have authorization - need to check permissions
+    true)
+
+  (visitPostgresGetUserByIdFunction [_ _ctx]
+    ;; FIXME - when we have ownership - need to check owner
+    "xtdb"))
 
 (defn- wrap-predicates [plan predicate]
   (or (when (seq? predicate)
@@ -2092,7 +2112,8 @@
                              (reduce (fn [left-table-ref ^ParserRuleContext table-ref]
                                        (let [!sq-refs (HashMap.)
                                              left-sq-scope (->SubqueryScope env left-table-ref !sq-refs)
-                                             right-table-ref (.accept table-ref (->TableRefVisitor env scope left-sq-scope))]
+                                             right-table-ref (.accept table-ref (->TableRefVisitor env scope (when left-table-ref
+                                                                                                               left-sq-scope)))]
                                          (if left-table-ref
                                            (->CrossJoinTable env !sq-refs left-table-ref right-table-ref)
                                            right-table-ref)))
@@ -2131,8 +2152,8 @@
                          :subqs (not-empty (into {} !subqs))
                          :aggs (not-empty (into {} !aggs))}))
 
-        {:keys [projected-cols windows] :as select-plan} (.accept select-clause (->SelectClauseProjectedCols env group-invar-col-tracker))
 
+        {:keys [projected-cols windows agg-subqs] :as select-plan} (.accept select-clause (->SelectClauseProjectedCols env group-invar-col-tracker))
         aggs (not-empty (merge (:aggs select-plan) (:aggs having-plan)))
         grouped-table? (boolean (or aggs group-by-clause))
         group-invariant-cols (when grouped-table?
@@ -2165,6 +2186,9 @@
             [:map (mapv #(hash-map % nil) unresolved-cr)
              plan]
             plan)
+
+          (cond-> plan
+            agg-subqs (apply-sqs agg-subqs))
 
           (cond-> plan
             grouped-table? (wrap-aggs aggs group-invariant-cols))

@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.test :as t :refer [deftest]]
             [xtdb.api :as xt]
-            [xtdb.buffer-pool :as bp]
+            [xtdb.compactor :as c]
             [xtdb.expression.metadata :as expr.meta]
             [xtdb.metadata :as meta]
             [xtdb.node :as xtn]
@@ -11,11 +11,11 @@
             [xtdb.time :as time]
             [xtdb.trie :as trie]
             [xtdb.util :as util]
-            [xtdb.vector.writer :as vw]
-            [xtdb.compactor :as c])
+            [xtdb.vector.writer :as vw])
   (:import (clojure.lang MapEntry)
-           (xtdb.util TemporalBounds TemporalDimension)
-           (xtdb.metadata IMetadataManager)))
+           xtdb.api.storage.Storage
+           (xtdb.metadata IMetadataManager)
+           (xtdb.util TemporalBounds TemporalDimension)))
 
 (t/use-fixtures :each tu/with-mock-clock tu/with-node)
 (t/use-fixtures :once tu/with-allocator)
@@ -135,7 +135,7 @@
             literal-selector (expr.meta/->metadata-selector '(and (< _id 11) (> _id 9)) '{_id :i64} vw/empty-args)]
 
         (t/testing "L0"
-          (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs") (trie/->log-l0-l1-trie-key 0 0 21 20))]
+          (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 0 0 21 20))]
             (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
               (let [page-idx-pred (.build literal-selector table-metadata)]
 
@@ -146,7 +146,7 @@
                   (t/is (true? (.test page-idx-pred page-idx))))))))
 
         (t/testing "L1"
-          (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs") (trie/->log-l0-l1-trie-key 1 0 21 20))]
+          (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 1 0 21 20))]
             (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
               (let [page-idx-pred (.build literal-selector table-metadata)]
 
@@ -163,7 +163,7 @@
   (tu/finish-chunk! tu/*node*)
 
   (let [^IMetadataManager metadata-mgr (tu/component tu/*node* ::meta/metadata-manager)
-        meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs") (trie/->log-l0-l1-trie-key 0 0 2 1))]
+        meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 0 0 2 1))]
     (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
       (let [sys-time-micros (time/instant->micros #xt/instant "2020-01-01T00:00:00.000000Z")
             temporal-dimension (TemporalDimension. sys-time-micros Long/MAX_VALUE)
@@ -178,7 +178,7 @@
         true-selector (expr.meta/->metadata-selector '(= boolean-or-int true) '{boolean-or-int :bool} vw/empty-args)]
 
     (t/testing "L0"
-      (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs") (trie/->log-l0-l1-trie-key 0 0 2 1))]
+      (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 0 0 2 1))]
         (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
           (let [page-idx-pred (.build true-selector table-metadata)]
             (t/is (= #{"_iid" "_system_from" "_valid_from" "_valid_to"}
@@ -189,7 +189,7 @@
     (c/compact-all! tu/*node*)
 
     (t/testing "L1"
-      (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs") (trie/->log-l0-l1-trie-key 1 0 2 1))]
+      (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 1 0 2 1))]
         (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
           (let [page-idx-pred (.build true-selector table-metadata)]
             (t/is (= #{"_iid" "_id" "_system_from" "_valid_from" "_valid_to" "boolean_or_int"}
@@ -209,21 +209,21 @@
 
       (let [^IMetadataManager metadata-mgr (tu/component node ::meta/metadata-manager)]
         (t/testing "L0"
-          (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs/") (trie/->log-l0-l1-trie-key 0 0 2 1))]
+          (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 0 0 2 1))]
             (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
               (tj/check-json (.toPath (io/as-file (io/resource "xtdb/metadata-test/set")))
 
-                             (.resolve node-dir (str "objects/" bp/version "/tables/")))
+                             (.resolve node-dir (str "objects/" Storage/version "/tables/")))
 
               (t/is (= #{"_iid" "_system_from" "_valid_from" "_valid_to"}
                        (.columnNames table-metadata))))))
 
         (t/testing "L1"
-          (let [meta-file-path (trie/->table-meta-file-path (util/->path "tables/public$xt_docs/") (trie/->log-l0-l1-trie-key 1 0 2 1))]
+          (let [meta-file-path (trie/->table-meta-file-path "public$xt_docs" (trie/->log-l0-l1-trie-key 1 0 2 1))]
             (util/with-open [table-metadata (.openTableMetadata metadata-mgr meta-file-path)]
               (tj/check-json (.toPath (io/as-file (io/resource "xtdb/metadata-test/set")))
 
-                             (.resolve node-dir (str "objects/" bp/version "/tables/")))
+                             (.resolve node-dir (str "objects/" Storage/version "/tables/")))
 
               (t/is (= #{"_iid" "_id" "_system_from" "_valid_from" "_valid_to" "colours" "utf8"}
                        (.columnNames table-metadata))))))))))

@@ -7,7 +7,8 @@
             [integrant.core :as ig]
             [xtdb.error :as err])
   (:import [clojure.lang Keyword MapEntry Symbol]
-           (java.io ByteArrayOutputStream File)
+           (io.netty.buffer Unpooled)
+           (java.io ByteArrayOutputStream File Writer)
            java.lang.AutoCloseable
            (java.net MalformedURLException ServerSocket URI URL)
            java.nio.ByteBuffer
@@ -17,16 +18,15 @@
            java.nio.file.attribute.FileAttribute
            [java.security MessageDigest]
            (java.util Arrays Collections LinkedHashMap Map UUID WeakHashMap)
-           (java.util.concurrent ExecutionException ExecutorService Executors ThreadFactory TimeUnit)
+           (java.util.concurrent ExecutionException Executors ThreadFactory)
            (org.apache.arrow.compression CommonsCompressionFactory)
            (org.apache.arrow.flatbuf Footer Message RecordBatch)
            (org.apache.arrow.memory ArrowBuf BufferAllocator ForeignAllocation)
-           (org.apache.arrow.memory.util ByteFunctionHelpers MemoryUtil)
+           (org.apache.arrow.memory.util ByteFunctionHelpers)
            (org.apache.arrow.vector BaseFixedWidthVector ValueVector VectorLoader VectorSchemaRoot)
            (org.apache.arrow.vector.complex ListVector UnionVector)
            (org.apache.arrow.vector.ipc ArrowFileWriter ArrowStreamWriter ArrowWriter)
            (org.apache.arrow.vector.ipc.message ArrowBlock ArrowFooter MessageSerializer)
-           (io.netty.buffer Unpooled)
            xtdb.util.NormalForm))
 
 (set! *unchecked-math* :warn-on-boxed)
@@ -182,6 +182,10 @@
 
 ;;; Common specs
 
+(defmethod print-method Path [^Path p, ^Writer w]
+  (.write w "#xt/path ")
+  (print-method (.toString p) w))
+
 (defn ->path ^Path [path-ish]
   (cond
     (instance? Path path-ish) path-ish
@@ -314,19 +318,11 @@
 (defn delete-file [^Path file]
   (Files/deleteIfExists file))
 
-(defn size-on-disk [^Path file]
-  (Files/size file))
-
 (defn mkdirs [^Path path]
   (Files/createDirectories path (make-array FileAttribute 0)))
 
 (defn is-file? [^Path path]
   (Files/isRegularFile path (make-array LinkOption 0)))
-
-(defn create-parents [^Path path]
-  (let [parents (.getParent path)]
-    (when-not (path-exists parents)
-      (mkdirs parents))))
 
 (defn file-extension [^File f]
   (second (re-find #"\.(.+?)$" (.getName f))))
@@ -339,19 +335,6 @@
   (with-open [file-ch (->file-channel to-path write-truncate-open-opts)
               buf-ch (->seekable-byte-channel from-buffer)]
     (.transferFrom file-ch buf-ch 0 (.size buf-ch))))
-
-(defn atomic-move [^Path from-path ^Path to-path]
-  (Files/move from-path to-path (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE]))
-  to-path)
-
-(defn prefix-key [^Path prefix ^Path k]
-  (cond->> k
-    prefix (.resolve prefix)))
-
-(def ^java.nio.file.Path tables-dir (->path "tables"))
-
-(defn table-name->table-path [^String table-name]
-  (.resolve tables-dir (-> table-name (str/replace #"[\.\/]" "\\$"))))
 
 (def ^Thread$UncaughtExceptionHandler uncaught-exception-handler
   (reify Thread$UncaughtExceptionHandler
@@ -370,14 +353,6 @@
           (doto t
             (.setName (str prefix "-" (.getName t)))
             (.setUncaughtExceptionHandler uncaught-exception-handler)))))))
-
-(defn shutdown-pool
-  ([^ExecutorService pool]
-   (shutdown-pool pool 60))
-  ([^ExecutorService pool ^long timeout-seconds]
-   (.shutdownNow pool)
-   (when-not (.awaitTermination pool timeout-seconds TimeUnit/SECONDS)
-     (log/warn "pool did not terminate" pool))))
 
 ;;; Arrow
 

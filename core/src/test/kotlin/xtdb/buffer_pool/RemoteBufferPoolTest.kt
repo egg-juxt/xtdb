@@ -1,6 +1,5 @@
 package xtdb.buffer_pool
 
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.apache.arrow.memory.BufferAllocator
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.types.pojo.Field
@@ -11,22 +10,19 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import xtdb.IBufferPool
-import xtdb.api.log.FileListCache
-import xtdb.api.storage.ObjectStore
+import xtdb.BufferPool
 import xtdb.api.storage.SimulatedObjectStore
-import xtdb.api.storage.Storage
+import xtdb.api.storage.Storage.remoteStorage
 import xtdb.api.storage.StoreOperation.COMPLETE
 import xtdb.api.storage.StoreOperation.UPLOAD
 import xtdb.arrow.I32_TYPE
 import xtdb.arrow.Relation
-import xtdb.util.requiringResolve
-import java.nio.ByteBuffer
-import java.nio.file.Files
+import java.nio.file.Files.createTempDirectory
 import java.nio.file.Path
+import kotlin.io.path.listDirectoryEntries
 
 class RemoteBufferPoolTest : BufferPoolTest() {
-    override fun bufferPool(): IBufferPool  = remoteBufferPool
+    override fun bufferPool(): BufferPool = remoteBufferPool
 
     private lateinit var allocator: BufferAllocator
     private lateinit var remoteBufferPool: RemoteBufferPool
@@ -34,18 +30,13 @@ class RemoteBufferPoolTest : BufferPoolTest() {
     @BeforeEach
     fun setUp() {
         allocator = RootAllocator()
-        remoteBufferPool = requiringResolve("xtdb.buffer-pool/open-remote-storage").invoke(
-            allocator,
-            Storage.remoteStorage(
-                object : ObjectStore.Factory {
-                    override fun openObjectStore(): ObjectStore = SimulatedObjectStore()
-                },
-                Files.createTempDirectory("remote-buffer-pool-test")
-                ),
-            FileListCache.SOLO,
-            SimpleMeterRegistry()) as RemoteBufferPool
+
+        remoteBufferPool =
+            remoteStorage(objectStore = { SimulatedObjectStore() }, createTempDirectory("remote-buffer-pool-test"))
+                .open(allocator)
+
         // Mocking small value for MIN_MULTIPART_PART_SIZE
-        RemoteBufferPool.setMinMultipartPartSize(320)
+        RemoteBufferPool.minMultipartPartSize = 320
     }
 
     @AfterEach
@@ -61,10 +52,8 @@ class RemoteBufferPoolTest : BufferPoolTest() {
         val schema = Schema(listOf(Field("a", FieldType(false, I32_TYPE, null), null)))
         Relation(allocator, schema).use { relation ->
             remoteBufferPool.openArrowWriter(path, relation).use { writer ->
-                val v = relation.get("a")!!
-                for (i in 0 until 10) {
-                    v.writeInt(i)
-                }
+                val v = relation["a"]!!
+                for (i in 0 until 10) v.writeInt(i)
                 writer.writeBatch()
                 writer.end()
             }
@@ -85,26 +74,23 @@ class RemoteBufferPoolTest : BufferPoolTest() {
         val schema = Schema(listOf(Field("a", FieldType(false, I32_TYPE, null), null)))
         Relation(allocator, schema).use { relation ->
             remoteBufferPool.openArrowWriter(Path.of("aw"), relation).use { writer ->
-                val v = relation.get("a")!!
-                for (i in 0 until 10) {
-                    v.writeInt(i)
-                }
+                val v = relation["a"]!!
+                for (i in 0 until 10) v.writeInt(i)
                 writer.writeBatch()
                 writer.end()
             }
         }
-        tmpDir.toFile().listFiles()?.let { assertEquals(0, it.size) }
+
+        assertEquals(0, tmpDir.listDirectoryEntries().size)
 
         val exception = assertThrows(Exception::class.java) {
             Relation(allocator, schema).use { relation ->
                 remoteBufferPool.openArrowWriter(Path.of("aw2"), relation).use { writer ->
                     // tmp file present
-                    tmpDir.toFile().listFiles()?.let { assertEquals(1, it.size) }
+                    assertEquals(1, tmpDir.listDirectoryEntries().size)
 
-                    val v = relation.get("a")!!
-                    for (i in 0 until 10) {
-                        v.writeInt(i)
-                    }
+                    val v = relation["a"]!!
+                    for (i in 0 until 10) v.writeInt(i)
                     writer.writeBatch()
                     writer.end()
                     throw Exception("Test exception")

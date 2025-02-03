@@ -3,8 +3,8 @@
             [clojure.test :as t]
             [integrant.core :as ig]
             [xtdb.api :as xt]
-            [xtdb.buffer-pool :as bp]
             [xtdb.node :as xtn]
+            [xtdb.object-store :as os]
             [xtdb.test-util :as tu]
             [xtdb.types :as types]
             [xtdb.util :as util])
@@ -15,13 +15,12 @@
            (java.nio.file Files Path)
            (java.nio.file.attribute FileAttribute)
            (org.apache.arrow.vector.types.pojo Schema)
-           xtdb.api.log.FileListCache
            (xtdb.api.storage ObjectStore$Factory Storage)
+           (xtdb.api.storage SimulatedObjectStore StoreOperation)
            xtdb.arrow.Relation
-           xtdb.buffer_pool.RemoteBufferPool
-           xtdb.cache.DiskCache
-           xtdb.IBufferPool
-           (xtdb.api.storage SimulatedObjectStore StoreOperation)))
+           (xtdb.buffer_pool LocalBufferPool MemoryBufferPool RemoteBufferPool)
+           xtdb.BufferPool
+           xtdb.cache.DiskCache))
 
 (defonce tmp-dirs (atom []))
 
@@ -41,18 +40,19 @@
 
 (t/deftest test-remote-buffer-pool-setup
   (util/with-tmp-dirs #{path}
-    (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:storage [:remote {:object-store [:in-memory {}]
-                                                                                    :local-disk-cache path}]}))]
-      (xt/submit-tx node [[:put-docs :foo {:xt/id :foo}]])
+                      (util/with-open [node (xtn/start-node (merge tu/*node-opts* {:storage [:remote {:object-store [:in-memory {}]
+                                                                                                      :local-disk-cache path}]
+                                                                                   :compactor {:threads 0}}))]
+                                                        (xt/submit-tx node [[:put-docs :foo {:xt/id :foo}]])
 
-      (t/is (= [{:xt/id :foo}]
-               (xt/q node '(from :foo [xt/id]))))
+                                                        (t/is (= [{:xt/id :foo}]
+                                                                 (xt/q node '(from :foo [xt/id]))))
 
-      (tu/finish-chunk! node)
+                                                        (tu/finish-chunk! node)
 
-      (let [^RemoteBufferPool buffer-pool (val (first (ig/find-derived (:system node) :xtdb/buffer-pool)))
-            object-store (.getObjectStore buffer-pool)]
-        (t/is (seq (.listAllObjects object-store)))))))
+                                                        (let [^RemoteBufferPool buffer-pool (val (first (ig/find-derived (:system node) :xtdb/buffer-pool)))
+                                                              object-store (.getObjectStore buffer-pool)]
+                                                          (t/is (seq (.listAllObjects object-store)))))))
 
 (defn utf8-buf [s] (ByteBuffer/wrap (.getBytes (str s) "utf-8")))
 
@@ -88,11 +88,9 @@
     (openObjectStore [_]
       (SimulatedObjectStore.))))
 
-(defn remote-test-buffer-pool ^xtdb.IBufferPool []
-  (bp/open-remote-storage tu/*allocator*
-                          (Storage/remoteStorage (simulated-obj-store-factory) (create-tmp-dir))
-                          FileListCache/SOLO
-                          (SimpleMeterRegistry.)))
+(defn remote-test-buffer-pool ^xtdb.BufferPool []
+  (-> (Storage/remoteStorage (simulated-obj-store-factory) (create-tmp-dir))
+      (.open tu/*allocator* (SimpleMeterRegistry.))))
 
 (defn get-remote-calls [^RemoteBufferPool test-bp]
   (.getCalls ^SimulatedObjectStore (.getObjectStore test-bp)))
@@ -108,20 +106,17 @@
   (let [files (filter #(.isFile ^File %) (file-seq (.toFile dir)))]
     {:file-count (count files) :file-names (set (map #(.getName ^File %) files))}))
 
-(defn insert-utf8-to-local-cache [^IBufferPool bp k len]
+(defn insert-utf8-to-local-cache [^BufferPool bp k len]
   (.putObject bp k (utf8-buf (apply str (repeat len "a"))))
   ;; Add to local disk cache
   (.getByteArray bp k))
 
 (t/deftest local-disk-cache-max-size
   (util/with-tmp-dirs #{local-disk-cache}
-    (with-open [bp (bp/open-remote-storage
-                    tu/*allocator*
-                    (-> (Storage/remoteStorage (simulated-obj-store-factory) local-disk-cache)
-                        (.maxDiskCacheBytes 10)
-                        (.maxCacheBytes 12))
-                    FileListCache/SOLO
-                    (SimpleMeterRegistry.))]
+    (with-open [bp (-> (Storage/remoteStorage (simulated-obj-store-factory) local-disk-cache)
+                       (.maxDiskCacheBytes 10)
+                       (.maxCacheBytes 12)
+                       (.open tu/*allocator* (SimpleMeterRegistry.)))]
       (t/testing "staying below max size - all elements available"
         (insert-utf8-to-local-cache bp (util/->path "a") 4)
         (insert-utf8-to-local-cache bp (util/->path "b") 4)
@@ -146,53 +141,46 @@
         path-b (util/->path "b")]
     (util/with-tmp-dirs #{local-disk-cache}
       ;; Writing files to buffer pool & local-disk-cache
-      (with-open [bp (bp/open-remote-storage
-                      tu/*allocator*
-                      (-> (Storage/remoteStorage obj-store-factory local-disk-cache)
-                          (.maxDiskCacheBytes 10)
-                          (.maxCacheBytes 12))
-                      FileListCache/SOLO
-                      (SimpleMeterRegistry.))]
+      (with-open [bp (-> (Storage/remoteStorage obj-store-factory local-disk-cache)
+                         (.maxDiskCacheBytes 10)
+                         (.maxCacheBytes 12)
+                         (.open tu/*allocator* (SimpleMeterRegistry.)))]
         (insert-utf8-to-local-cache bp path-a 4)
         (insert-utf8-to-local-cache bp path-b 4)
         (t/is (= {:file-count 2 :file-names #{"a" "b"}} (file-info local-disk-cache))))
 
       ;; Starting a new buffer pool - should load buffers correctly from disk (can be sure its grabbed from disk since using a memory cache and memory object store)
-      (with-open [bp (bp/open-remote-storage
-                      tu/*allocator*
-                      (-> (Storage/remoteStorage obj-store-factory local-disk-cache)
-                          (.maxDiskCacheBytes 10)
-                          (.maxCacheBytes 12))
-                      FileListCache/SOLO
-                      (SimpleMeterRegistry.))]
+      (with-open [bp (-> (Storage/remoteStorage obj-store-factory local-disk-cache)
+                         (.maxDiskCacheBytes 10)
+                         (.maxCacheBytes 12)
+                         (.open tu/*allocator* (SimpleMeterRegistry.)))]
         (t/is (= 0 (util/compare-nio-buffers-unsigned (utf8-buf "aaaa") (ByteBuffer/wrap (.getByteArray bp path-a)))))
 
         (t/is (= 0 (util/compare-nio-buffers-unsigned (utf8-buf "aaaa") (ByteBuffer/wrap (.getByteArray bp path-b)))))))))
 
 (t/deftest local-buffer-pool
   (tu/with-tmp-dirs #{tmp-dir}
-    (with-open [bp (bp/open-local-storage tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))]
+    (with-open [bp (LocalBufferPool. tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))]
       (t/testing "empty buffer pool"
         (t/is (= [] (.listAllObjects bp)))
-        (t/is (= [] (.listObjects bp (.toPath (io/file "foo")))))))))
+        (t/is (= [] (.listAllObjects bp (.toPath (io/file "foo")))))))))
 
 (t/deftest dont-list-temporary-objects-3544
   (tu/with-tmp-dirs #{tmp-dir}
     (let [schema (Schema. [(types/col-type->field "a" :i32)])]
-      (with-open [bp (bp/open-local-storage tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))
+      (with-open [bp (LocalBufferPool. tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))
                   rel (Relation. tu/*allocator* schema)
                   _arrow-writer (.openArrowWriter bp (.toPath (io/file "foo")) rel)]
         (t/is (= [] (.listAllObjects bp)))))))
 
-(defn fetch-buffer-pool-from-node
-  [node]
-  (val (first (ig/find-derived (:system node) :xtdb/buffer-pool))))
+(defn fetch-buffer-pool-from-node [node]
+  (util/component node :xtdb/buffer-pool))
 
-(defn put-edn [^IBufferPool buffer-pool ^Path k obj]
+(defn put-edn [^BufferPool buffer-pool ^Path k obj]
   (let [^ByteBuffer buf (.encode StandardCharsets/UTF_8 (pr-str obj))]
     (.putObject buffer-pool k buf)))
 
-(defn test-list-objects [^IBufferPool buffer-pool]
+(defn test-list-objects [^BufferPool buffer-pool]
   (put-edn buffer-pool (util/->path "bar/alice") :alice)
   (put-edn buffer-pool (util/->path "foo/alan") :alan)
   (put-edn buffer-pool (util/->path "bar/bob") :bob)
@@ -200,36 +188,36 @@
   (put-edn buffer-pool (util/->path "bar/baza/james") :james)
   (Thread/sleep 1000)
 
-  (t/is (= (mapv util/->path ["bar/alice" "bar/baz/dan" "bar/baza/james" "bar/bob" "foo/alan"])
-           (.listAllObjects buffer-pool)))
+  (t/is (= [(os/->StoredObject "bar/alice" 6)
+            (os/->StoredObject "bar/baz/dan" 4)
+            (os/->StoredObject "bar/baza/james" 6)
+            (os/->StoredObject "bar/bob" 4)
+            (os/->StoredObject "foo/alan" 5)]
+           (vec (.listAllObjects buffer-pool))))
 
-  (t/is (= (mapv util/->path ["foo/alan"])
-           (.listObjects buffer-pool (util/->path "foo"))))
+  (t/is (= [(os/->StoredObject "foo/alan" 5)]
+           (vec (.listAllObjects buffer-pool (util/->path "foo")))))
 
-  (t/testing "call listObjects with a prefix ended with a slash - should work the same"
-    (t/is (= (mapv util/->path ["foo/alan"])
-             (.listObjects buffer-pool (util/->path "foo/")))))
+  (t/testing "call listAllObjects with a prefix ended with a slash - should work the same"
+    (t/is (= [(os/->StoredObject "foo/alan" 5)]
+             (vec (.listAllObjects buffer-pool (util/->path "foo/"))))))
 
-  (t/testing "calling listObjects with prefix on directory with subdirectories - should only return top level keys"
-    (t/is (= (mapv util/->path ["bar/alice" "bar/baz" "bar/baza" "bar/bob"])
-             (.listObjects buffer-pool (util/->path "bar")))))
+  (t/testing "calling listAllObjects with prefix on directory with subdirectories - still lists recursively, and relative to the root"
+    (t/is (= [(os/->StoredObject "bar/alice" 6)
+              (os/->StoredObject "bar/baz/dan" 4)
+              (os/->StoredObject "bar/baza/james" 6)
+              (os/->StoredObject "bar/bob" 4)]
+             (vec (.listAllObjects buffer-pool (util/->path "bar"))))))
 
-  (t/testing "calling listObjects with prefix with common prefix - should only return that which is a complete match against a directory "
-    (t/is (= (mapv util/->path ["bar/baz/dan"])
-             (.listObjects buffer-pool (util/->path "bar/baz")))))
-
-  (t/testing "objectSize"
-    (t/is (= 6 (.objectSize buffer-pool (util/->path "bar/alice"))))
-    (t/is (= 5 (.objectSize buffer-pool (util/->path "foo/alan"))))
-    (t/is (= 4 (.objectSize buffer-pool (util/->path "bar/bob"))))
-    (t/is (= 4 (.objectSize buffer-pool (util/->path "bar/baz/dan"))))
-    (t/is (= 6 (.objectSize buffer-pool (util/->path "bar/baza/james"))))))
+  (t/testing "calling listAllObjects with prefix with common prefix - should only return that which is a complete match against a directory "
+    (t/is (= [(os/->StoredObject "bar/baz/dan" 4)]
+             (vec (.listAllObjects buffer-pool (util/->path "bar/baz")))))))
 
 (t/deftest test-memory-list-objs
-  (with-open [bp (bp/open-in-memory-storage tu/*allocator* (SimpleMeterRegistry.))]
+  (with-open [bp (MemoryBufferPool. tu/*allocator* (SimpleMeterRegistry.))]
     (test-list-objects bp)))
 
 (t/deftest test-local-list-objs
   (tu/with-tmp-dirs #{tmp-dir}
-    (with-open [bp (bp/open-local-storage tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))]
+    (with-open [bp (LocalBufferPool. tu/*allocator* (Storage/localStorage tmp-dir) (SimpleMeterRegistry.))]
       (test-list-objects bp))))

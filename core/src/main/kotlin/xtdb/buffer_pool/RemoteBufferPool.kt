@@ -1,96 +1,96 @@
 package xtdb.buffer_pool
 
-import com.github.benmanes.caffeine.cache.Cache
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.runBlocking
 import org.apache.arrow.memory.ArrowBuf
 import org.apache.arrow.memory.BufferAllocator
-import org.apache.arrow.vector.ipc.SeekableReadChannel
 import org.apache.arrow.vector.ipc.message.ArrowFooter
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
 import org.slf4j.LoggerFactory
-import xtdb.IBufferPool
+import xtdb.BufferPool
 import xtdb.IEvictBufferTest
-import xtdb.api.log.FileListCache
 import xtdb.api.storage.ObjectStore
-import xtdb.arrow.ArrowUtil
+import xtdb.api.storage.Storage.RemoteStorageFactory
+import xtdb.api.storage.Storage.arrowFooterCache
+import xtdb.api.storage.Storage.openStorageChildAllocator
+import xtdb.api.storage.Storage.registerMetrics
 import xtdb.arrow.ArrowUtil.arrowBufToRecordBatch
+import xtdb.arrow.ArrowUtil.openArrowBufView
 import xtdb.arrow.ArrowUtil.readArrowFooter
-import xtdb.arrow.ArrowUtil.toArrowBufView
+import xtdb.arrow.ArrowUtil.toByteArray
 import xtdb.arrow.Relation
 import xtdb.cache.DiskCache
 import xtdb.cache.MemoryCache
 import xtdb.cache.PathSlice
 import xtdb.multipart.SupportsMultipart
-import xtdb.util.requiringResolve
-import xtdb.util.toMmapPath
+import xtdb.trie.FileSize
 import xtdb.util.closeOnCatch
+import xtdb.util.maxDirectMemory
+import xtdb.util.newSeekableByteChannel
+import xtdb.util.toMmapPath
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
-import java.util.*
-import java.util.concurrent.CompletableFuture
+import kotlin.io.path.createDirectories
+import kotlin.io.path.deleteIfExists
+import kotlin.io.path.fileSize
 
 class RemoteBufferPool(
-    private val allocator: BufferAllocator,
-    private val memoryCache: MemoryCache,
-    val diskCache: DiskCache,
-    private val arrowFooterCache: Cache<Path, ArrowFooter>,
-    private val fileListCache: FileListCache,
+    factory: RemoteStorageFactory,
+    allocator: BufferAllocator,
     val objectStore: ObjectStore,
-    val osFiles: SortedMap<Path, Long>,
-    private val osFilesSubscription: AutoCloseable,
-    private val recordBatchRequests: Counter,
-    private val memCacheMisses: Counter,
-    private val diskCacheMisses: Counter
-) : IBufferPool, IEvictBufferTest, Closeable {
+    meterRegistry: MeterRegistry,
+) : BufferPool, IEvictBufferTest, Closeable {
+
+    private val allocator = allocator.openStorageChildAllocator().also { it.registerMetrics(meterRegistry) }
+
+    private val arrowFooterCache = arrowFooterCache()
+
+    private val memoryCache =
+        MemoryCache(allocator, factory.maxCacheBytes ?: (maxDirectMemory / 2))
+            .also { it.registerMetrics("memory-cache", meterRegistry) }
+
+    val diskCache = DiskCache(
+        factory.localDiskCache.also { it.createDirectories() },
+        factory.maxDiskCacheBytes
+            ?: (factory.localDiskCache.totalSpace * (factory.maxDiskCachePercentage / 100.0).toLong())
+    )
+
+    private val recordBatchRequests: Counter = meterRegistry.counter("record-batch-requests")
+    private val memCacheMisses: Counter = meterRegistry.counter("mem-cache-misses")
+    private val diskCacheMisses: Counter = meterRegistry.counter("disk-cache-misses")
 
     companion object {
-        private var minMultipartPartSize = 5 * 1024 * 1024
-        private const val MAX_MULTIPART_PER_UPLOAD_CONCURRENCY = 4
+        internal var minMultipartPartSize = 5 * 1024 * 1024
+        private const val MAX_CONCURRENT_PART_UPLOADS = 4
 
-        internal fun setMinMultipartPartSize(size: Int) {
-            minMultipartPartSize = size
-        }
-
-        private val FileNotificationAddition = requiringResolve("xtdb.file-list-cache/addition")
-
-        private fun pathToSeekableByteChannel(path: Path) = SeekableReadChannel(Files.newByteChannel(path, READ))
+        private val Path.totalSpace get() = Files.getFileStore(this).totalSpace
 
         private val LOGGER = LoggerFactory.getLogger(RemoteBufferPool::class.java)
 
-        private fun listFilesUnderPrefix(files: SortedMap<Path, Long>, prefix: Path): List<Path> {
-            val prefixDepth = prefix.nameCount
-            return files.tailMap(prefix).keys
-                .asSequence()
-                .takeWhile { it.startsWith(prefix) }
-                .mapNotNull { path -> if (path.nameCount > prefixDepth) path.subpath(0, prefixDepth + 1) else null }
-                .distinct()
-                .toList()
-        }
+        private val multipartUploadDispatcher =
+            Dispatchers.IO.limitedParallelism(MAX_CONCURRENT_PART_UPLOADS, "upload-multipart")
 
         @JvmStatic
-        fun uploadMultipartBuffers(objectStore: ObjectStore, key: Path, nioBuffers: List<ByteBuffer>) {
-            val upload = (objectStore as SupportsMultipart).startMultipart(key).get()
+        fun <P> SupportsMultipart<P>.uploadMultipartBuffers(key: Path, nioBuffers: List<ByteBuffer>) = runBlocking {
+            val upload = startMultipart(key).await()
 
             try {
-                val partQueue = ArrayDeque(nioBuffers)
-                val waitingParts = mutableListOf<CompletableFuture<*>>()
-
-                while (partQueue.isNotEmpty()) {
-                    if (waitingParts.size < MAX_MULTIPART_PER_UPLOAD_CONCURRENCY) {
-                        val buffer = partQueue.removeFirst()
-                        waitingParts.add(upload.uploadPart(buffer))
-                    } else {
-                        CompletableFuture.anyOf(*waitingParts.toTypedArray()).get()
-                        waitingParts.removeAll { it.isDone }
+                val waitingParts = nioBuffers.map {
+                    async(multipartUploadDispatcher) {
+                        upload.uploadPart(it).await()
                     }
                 }
 
-                CompletableFuture.allOf(*waitingParts.toTypedArray()).get()
-                upload.complete().get()
+                upload.complete(waitingParts.awaitAll()).await()
             } catch (e: Throwable) {
                 try {
                     LOGGER.warn("Error caught in uploadMultipartBuffers - aborting multipart upload of $key")
@@ -103,15 +103,13 @@ class RemoteBufferPool(
             }
         }
 
-        private fun arrowBufCuts(arrowBuf: ArrowBuf): List<Long> {
+        private fun ArrowBuf.cuts(): List<Long> {
             val cuts = mutableListOf<Long>()
             var prevCut = 0L
             var cut = 0L
 
-            val blocks = readArrowFooter(arrowBuf).recordBatches
-            for (block in blocks) {
-                val offset = block.offset
-                val offsetDelta = offset - cut
+            for (block in this.readArrowFooter().recordBatches) {
+                val offsetDelta = block.offset - cut
                 val totalLength = offsetDelta + block.metadataLength + block.bodyLength
                 val newCut = cut + totalLength
                 val cutLen = newCut - prevCut
@@ -126,31 +124,26 @@ class RemoteBufferPool(
             return cuts
         }
 
-        private fun arrowBufToParts(arrowBuf: ArrowBuf): List<ByteBuffer> {
+        private fun ArrowBuf.toParts(): List<ByteBuffer> {
             var prevCut = 0L
-            val cuts = arrowBufCuts(arrowBuf)
             val partBuffers = mutableListOf<ByteBuffer>()
 
-            for (cut in cuts) {
-                partBuffers.add(arrowBuf.nioBuffer(prevCut, (cut - prevCut).toInt()))
+            for (cut in cuts()) {
+                partBuffers.add(nioBuffer(prevCut, (cut - prevCut).toInt()))
                 prevCut = cut
             }
 
-            val finalPart = arrowBuf.nioBuffer(prevCut, (arrowBuf.capacity() - prevCut).toInt())
-            partBuffers.add(finalPart)
-            return partBuffers
+            return partBuffers.also { it.add(nioBuffer(prevCut, (capacity() - prevCut).toInt())) }
         }
+    }
 
-        private fun uploadArrowFile(allocator: BufferAllocator, objectStore: ObjectStore, key: Path, tmpPath: Path) {
-            val mmapBuffer = toMmapPath(tmpPath)
+    private fun ObjectStore.uploadArrowFile(key: Path, tmpPath: Path) {
+        val mmapBuffer = toMmapPath(tmpPath)
 
-            if (objectStore !is SupportsMultipart || mmapBuffer.remaining() <= minMultipartPartSize) {
-                objectStore.putObject(key, mmapBuffer).get()
-            } else {
-                toArrowBufView(allocator, mmapBuffer).use { arrowBuf ->
-                    uploadMultipartBuffers(objectStore, key, arrowBufToParts(arrowBuf))
-                }
-            }
+        if (this !is SupportsMultipart<*> || mmapBuffer.remaining() <= minMultipartPartSize) {
+            putObject(key, mmapBuffer).get()
+        } else {
+            mmapBuffer.openArrowBufView(allocator).use { uploadMultipartBuffers(key, it.toParts()) }
         }
     }
 
@@ -161,7 +154,7 @@ class RemoteBufferPool(
                 diskCacheMisses.increment()
                 objectStore.getObject(k, tmpFile)
             }.thenApply { entry -> Pair(PathSlice(entry.path, pathSlice.offset, pathSlice.length), entry) }
-        }.use(ArrowUtil::arrowBufToByteArray)
+        }.use { it.toByteArray() }
 
     override fun getFooter(key: Path): ArrowFooter = arrowFooterCache.get(key) {
         diskCache
@@ -169,7 +162,7 @@ class RemoteBufferPool(
                 diskCacheMisses.increment()
                 objectStore.getObject(k, tmpFile)
             }.get()
-            .use { entry -> Relation.readFooter(pathToSeekableByteChannel(entry.path)) }
+            .use { entry -> Relation.readFooter(entry.path.newSeekableByteChannel()) }
     }
 
     override fun getRecordBatch(key: Path, blockIdx: Int): ArrowRecordBatch {
@@ -186,58 +179,47 @@ class RemoteBufferPool(
                 objectStore.getObject(k, tmpFile)
             }.thenApply { entry -> Pair(PathSlice(entry.path, pathSlice.offset, pathSlice.length), entry) }
         }.use { arrowBuf ->
-            arrowBufToRecordBatch(
-                arrowBuf, 0, block.metadataLength, block.bodyLength,
-                "Failed opening record batch '$key' at block-idx $blockIdx"
+            arrowBuf.arrowBufToRecordBatch(
+                0, block.metadataLength, block.bodyLength, "Failed opening record batch '$key' at block-idx $blockIdx"
             )
         }
     }
 
-    override fun listAllObjects(): List<Path> = osFiles.keys.toList()
-
-    override fun listObjects(dir: Path): List<Path> = listFilesUnderPrefix(osFiles, dir)
-
-    override fun objectSize(key: Path): Long = osFiles[key] ?: 0
+    override fun listAllObjects() = objectStore.listAllObjects()
+    override fun listAllObjects(dir: Path) = objectStore.listAllObjects(dir)
 
     override fun openArrowWriter(key: Path, rel: Relation): xtdb.ArrowWriter {
         val tmpPath = diskCache.createTempPath()
-        return FileChannel.open(tmpPath, READ, WRITE, TRUNCATE_EXISTING).closeOnCatch { fileChannel ->
-            rel.startUnload(fileChannel).closeOnCatch { unloader ->
-                object : xtdb.ArrowWriter {
-                    override fun writeBatch() {
-                        unloader.writeBatch()
-                    }
 
-                    override fun end() {
-                        unloader.end()
-                        fileChannel.close()
+        return FileChannel.open(tmpPath, READ, WRITE, TRUNCATE_EXISTING)
+            .closeOnCatch { fileChannel ->
+                rel.startUnload(fileChannel).closeOnCatch { unloader ->
+                    object : xtdb.ArrowWriter {
+                        override fun writeBatch() = unloader.writeBatch()
 
-                        uploadArrowFile(allocator, objectStore, key, tmpPath)
+                        override fun end(): FileSize {
+                            unloader.end()
+                            fileChannel.close()
 
-                        fileListCache.appendFileNotification(
-                            FileNotificationAddition.invoke(key, tmpPath) as FileListCache.Notification
-                        )
+                            val size = tmpPath.fileSize()
+                            objectStore.uploadArrowFile(key, tmpPath)
 
-                        diskCache.put(key, tmpPath)
-                    }
+                            diskCache.put(key, tmpPath)
+                            return size
+                        }
 
-                    override fun close() {
-                        unloader.close()
-                        if (fileChannel.isOpen) fileChannel.close()
-                        Files.deleteIfExists(tmpPath)
+                        override fun close() {
+                            unloader.close()
+                            if (fileChannel.isOpen) fileChannel.close()
+                            tmpPath.deleteIfExists()
+                        }
                     }
                 }
             }
-        }
     }
 
     override fun putObject(key: Path, buffer: ByteBuffer) {
-        objectStore.putObject(key, buffer)
-            .thenApply {
-                fileListCache.appendFileNotification(
-                    FileNotificationAddition.invoke(key, buffer.capacity()) as FileListCache.Notification
-                )
-            }.get()
+        objectStore.putObject(key, buffer).get()
     }
 
     override fun evictCachedBuffer(key: Path) {
@@ -246,7 +228,6 @@ class RemoteBufferPool(
 
     override fun close() {
         memoryCache.close()
-        osFilesSubscription.close()
         objectStore.close()
         allocator.close()
     }

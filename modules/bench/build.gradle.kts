@@ -3,7 +3,7 @@ import xtdb.DataReaderTransformer
 plugins {
     `java-library`
     id("dev.clojurephant.clojure")
-    id("com.github.johnrengelman.shadow")
+    id("com.gradleup.shadow")
 }
 
 java.toolchain.languageVersion.set(JavaLanguageVersion.of(21))
@@ -13,7 +13,7 @@ dependencies {
     api(project(":xtdb-api"))
     api(project(":xtdb-core"))
     api(project(":xtdb-http-client-jvm"))
-    api(project(":modules:datasets"))
+    api(project(":modules:xtdb-datasets"))
     api(project(":modules:xtdb-kafka"))
     api(project(":modules:xtdb-aws"))
 

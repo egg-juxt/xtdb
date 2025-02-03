@@ -1,6 +1,5 @@
 (ns xtdb.log
   (:require [clojure.string :as str]
-            [clojure.tools.logging :as log]
             [integrant.core :as ig]
             [xtdb.api :as xt]
             [xtdb.error :as err]
@@ -11,151 +10,22 @@
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.writer :as vw])
-  (:import java.lang.AutoCloseable
-           (java.nio.channels ClosedChannelException)
-           (java.time Instant)
-           java.time.Duration
+  (:import (java.time Duration Instant)
            (java.util ArrayList HashMap)
-           (java.util.concurrent Semaphore)
+           [java.util.concurrent TimeUnit]
            org.apache.arrow.memory.BufferAllocator
            (org.apache.arrow.vector VectorSchemaRoot)
            (org.apache.arrow.vector.types.pojo ArrowType$Union FieldType Schema)
            org.apache.arrow.vector.types.UnionMode
-           (xtdb.api.log Log Log$Factory TxLog$Record TxLog$Subscriber)
+           (xtdb.api Xtdb$Config)
+           (xtdb.api.log Log Log$Factory Log$Message$Tx)
            (xtdb.api.tx TxOp$Sql)
-           (xtdb.arrow Relation VectorWriter Vector)
+           (xtdb.arrow Relation Vector VectorWriter)
+           xtdb.indexer.LogProcessor
            (xtdb.tx_ops Abort AssertExists AssertNotExists Call Delete DeleteDocs Erase EraseDocs Insert PatchDocs PutDocs SqlByteArgs Update XtqlAndArgs)
            xtdb.types.ClojureForm))
 
 (set! *unchecked-math* :warn-on-boxed)
-
-(def ^java.util.concurrent.ThreadFactory subscription-thread-factory
-  (util/->prefix-thread-factory "xtdb-tx-subscription"))
-
-(defn- tx-handler [^TxLog$Subscriber subscriber]
-  (fn [_last-tx-id ^TxLog$Record record]
-    (when (Thread/interrupted)
-      (throw (InterruptedException.)))
-
-    (.accept subscriber record)
-
-    (.getTxId record)))
-
-#_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
-(defn handle-polling-subscription [^Log log, after-tx-id, {:keys [^Duration poll-sleep-duration]}, ^TxLog$Subscriber subscriber]
-  (doto (.newThread subscription-thread-factory
-                    (fn []
-                      (let [thread (Thread/currentThread)]
-                        (.setPriority thread Thread/MAX_PRIORITY)
-                        (.onSubscribe subscriber (reify AutoCloseable
-                                                   (close [_]
-                                                     (.interrupt thread)
-                                                     (.join thread)))))
-                      (try
-                        (loop [after-tx-id after-tx-id]
-                          (let [last-tx-id (reduce (tx-handler subscriber)
-                                                   after-tx-id
-                                                   (try
-                                                     (.readTxs log after-tx-id 100)
-                                                     (catch ClosedChannelException e (throw e))
-                                                     (catch InterruptedException e (throw e))
-                                                     (catch Exception e
-                                                       (log/warn e "Error polling for txs, will retry"))))]
-                            (when (Thread/interrupted)
-                              (throw (InterruptedException.)))
-                            (when (= after-tx-id last-tx-id)
-                              (Thread/sleep (.toMillis poll-sleep-duration)))
-                            (recur last-tx-id)))
-                        (catch InterruptedException _)
-                        (catch ClosedChannelException _))))
-    (.start)))
-
-#_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
-(definterface INotifyingSubscriberHandler
-  (notifyTx [^long txId])
-  (subscribe [^xtdb.api.log.Log log, ^Long after-tx-id, ^xtdb.api.log.TxLog$Subscriber subscriber]))
-
-(defrecord NotifyingSubscriberHandler [!state]
-  INotifyingSubscriberHandler
-  (notifyTx [_ tx-id]
-    (let [{:keys [semaphores]} (swap! !state assoc :latest-submitted-tx-id tx-id)]
-      (doseq [^Semaphore semaphore semaphores]
-        (.release semaphore))))
-
-  (subscribe [_ log after-tx-id subscriber]
-    (let [semaphore (Semaphore. 0)
-          {:keys [latest-submitted-tx-id]} (swap! !state update :semaphores conj semaphore)]
-
-      (doto (.newThread subscription-thread-factory
-                        (fn []
-                          (let [thread (Thread/currentThread)]
-                            (.setPriority thread Thread/MAX_PRIORITY)
-                            (.onSubscribe subscriber (reify AutoCloseable
-                                                       (close [_]
-                                                         (.interrupt thread)
-                                                         (.join thread)))))
-                          (try
-                            (loop [after-tx-id after-tx-id]
-                              (let [last-tx-id (reduce (tx-handler subscriber)
-                                                       after-tx-id
-                                                       (if (and latest-submitted-tx-id
-                                                                (pos? ^long latest-submitted-tx-id)
-                                                                (or (nil? after-tx-id)
-                                                                    (< ^long after-tx-id ^long latest-submitted-tx-id)))
-                                                         ;; catching up
-                                                         (->> (.readTxs log after-tx-id 100)
-                                                              (take-while #(<= (.getTxId ^TxLog$Record %)
-                                                                               ^long latest-submitted-tx-id)))
-
-                                                         ;; running live
-                                                         (let [permits (do
-                                                                         (.acquire semaphore)
-                                                                         (inc (.drainPermits semaphore)))]
-                                                           (.readTxs log after-tx-id
-                                                                     (if (> permits 100)
-                                                                           (do
-                                                                             (.release semaphore (- permits 100))
-                                                                             100)
-                                                                           permits)))))]
-                                (when-not (Thread/interrupted)
-                                  (recur last-tx-id))))
-
-                            (catch InterruptedException _)
-
-                            (catch ClosedChannelException ex
-                              (when-not (Thread/interrupted)
-                                (throw ex)))
-
-                            (finally
-                              (swap! !state update :semaphores disj semaphore)))))
-        (.start)))))
-
-(defn ->notifying-subscriber-handler [latest-submitted-tx-id]
-  (->NotifyingSubscriberHandler (atom {:latest-submitted-tx-id latest-submitted-tx-id
-                                       :semaphores #{}})))
-
-;; header bytes
-(def ^:const hb-user-arrow-transaction
-  "Header byte for log records representing an arrow user transaction.
-
-  A standard arrow stream IPC buffer will contain this byte, so you do not need to prefix."
-  255)
-
-(def ^:const hb-flush-chunk
-  "Header byte for log records representing a signal to flush the live chunk to durable storage.
-
-  Can be useful to protect against data loss potential when a retention period is used for the log, so messages do not remain in the log forever.
-
-  TxRecord layout:
-
-  - header (byte=2)
-
-  - expected-last-tx-id in previous chunk (long)
-  If this tx-id match the last tx-id who has been indexed in durable storage, then this signal is ignored.
-  This is to avoid a herd effect in multi-node environments where multiple flush signals for the same chunk might be received.
-
-  See xtdb.stagnant-log-flusher"
-  2)
 
 (def ^:private ^org.apache.arrow.vector.types.pojo.Field tx-ops-field
   (types/->field "tx-ops" (ArrowType$Union. UnionMode/Dense nil) false))
@@ -419,11 +289,21 @@
 
       (.getAsArrowStream rel))))
 
+(defmethod xtn/apply-config! ::memory-log [^Xtdb$Config config _ {:keys [instant-src]}]
+  (doto config
+    (.setLog (cond-> (Log/getInMemoryLog)
+                   instant-src (.instantSource instant-src)))))
+
+(defmethod xtn/apply-config! ::local-directory-log [^Xtdb$Config config _ {:keys [path instant-src]}]
+  (doto config
+    (.setLog (cond-> (Log/localLog (util/->path path))
+                   instant-src (.instantSource instant-src)))))
+
 (defmethod xtn/apply-config! :xtdb/log [config _ [tag opts]]
   (xtn/apply-config! config
                      (case tag
-                       :in-memory :xtdb.log/memory-log
-                       :local :xtdb.log/local-directory-log
+                       :in-memory ::memory-log
+                       :local ::local-directory-log
                        :kafka :xtdb.kafka/log)
                      opts))
 
@@ -436,7 +316,40 @@
 (defn submit-tx& ^java.util.concurrent.CompletableFuture
   [{:keys [^BufferAllocator allocator, ^Log log, default-tz]} tx-ops {:keys [system-time] :as opts}]
 
-  (.appendTx log (serialize-tx-ops allocator tx-ops
-                                   (-> (select-keys opts [:authn])
-                                       (assoc :default-tz (:default-tz opts default-tz)
-                                              :system-time (some-> system-time time/expect-instant))))))
+  (.appendMessage log
+                  (Log$Message$Tx. (serialize-tx-ops allocator tx-ops
+                                                     (-> (select-keys opts [:authn])
+                                                         (assoc :default-tz (:default-tz opts default-tz)
+                                                                :system-time (some-> system-time time/expect-instant)))))))
+
+(defmethod ig/prep-key :xtdb.log/processor [_ opts]
+  (when opts
+    (into {:allocator (ig/ref :xtdb/allocator)
+           :indexer (ig/ref :xtdb/indexer)
+           :live-idx (ig/ref :xtdb.indexer/live-index)
+           :log (ig/ref :xtdb/log)
+           :trie-catalog (ig/ref :xtdb/trie-catalog)
+           :metrics-registry (ig/ref :xtdb.metrics/registry)
+           :chunk-flush-duration #xt/duration "PT4H"}
+          opts)))
+
+(defmethod ig/init-key :xtdb.log/processor [_ {:keys [allocator indexer log live-idx trie-catalog metrics-registry chunk-flush-duration] :as deps}]
+  (when deps
+    (LogProcessor. allocator indexer live-idx log trie-catalog metrics-registry chunk-flush-duration)))
+
+(defmethod ig/halt-key! :xtdb.log/processor [_ ^LogProcessor log-processor]
+  (util/close log-processor))
+
+(defn await-tx
+  (^java.util.concurrent.CompletableFuture [{:keys [^LogProcessor log-processor]}]
+   (-> @(.awaitAsync log-processor)
+       (util/rethrowing-cause)))
+
+  (^java.util.concurrent.CompletableFuture [{:keys [^LogProcessor log-processor]} ^long tx-id]
+   (-> @(.awaitAsync log-processor tx-id)
+       (util/rethrowing-cause)))
+
+  (^java.util.concurrent.CompletableFuture [{:keys [^LogProcessor log-processor]} ^long tx-id ^Duration timeout]
+   (-> @(cond-> (.awaitAsync log-processor tx-id)
+          timeout (.orTimeout (.toMillis timeout) TimeUnit/MILLISECONDS))
+       (util/rethrowing-cause))))

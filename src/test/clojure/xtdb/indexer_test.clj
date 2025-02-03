@@ -8,6 +8,8 @@
             [xtdb.compactor :as c]
             [xtdb.indexer :as idx]
             [xtdb.metadata :as meta]
+            [xtdb.object-store :as os]
+            [xtdb.protocols :as xtp]
             [xtdb.serde :as serde]
             [xtdb.test-json :as tj]
             [xtdb.test-util :as tu]
@@ -20,7 +22,7 @@
            (java.time Duration InstantSource)
            [org.apache.arrow.vector.types UnionMode]
            [org.apache.arrow.vector.types.pojo ArrowType$Union]
-           xtdb.IBufferPool
+           xtdb.BufferPool
            (xtdb.metadata IMetadataManager)))
 
 (t/use-fixtures :once tu/with-allocator)
@@ -286,8 +288,9 @@
         (t/is (= last-tx-key (tu/latest-completed-tx node)))
 
         (with-open [node (tu/->local-node {:node-dir node-dir})]
+          (tu/then-await-tx magic-last-tx-id node (Duration/ofSeconds 2))
           (t/is (= last-tx-key
-                   (tu/then-await-tx magic-last-tx-id node (Duration/ofSeconds 2))))
+                   (xtp/latest-completed-tx node)))
 
           (t/is (= last-tx-key (tu/latest-completed-tx node))))
 
@@ -299,10 +302,10 @@
   (let [node-dir (util/->path "target/can-ingest-ts-devices-mini")]
     (util/delete-dir node-dir)
 
-    (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-chunk 3000, :rows-per-block 300})
+    (with-open [node (tu/->local-node {:node-dir node-dir, :rows-per-chunk 3000, :rows-per-block 300, :compactor-threads 0})
                 info-reader (io/reader (io/resource "devices_mini_device_info.csv"))
                 readings-reader (io/reader (io/resource "devices_mini_readings.csv"))]
-      (let [^IBufferPool bp (tu/component node :xtdb/buffer-pool)
+      (let [^BufferPool bp (tu/component node :xtdb/buffer-pool)
             ^IMetadataManager mm (tu/component node ::meta/metadata-manager)
             device-infos (map ts/device-info-csv->doc (csv/read-csv info-reader))
             readings (map ts/readings-csv->doc (csv/read-csv readings-reader))
@@ -330,7 +333,7 @@
                    (-> (meta/latest-chunk-metadata mm)
                        (select-keys [:latest-completed-tx :next-chunk-idx]))))
 
-          (let [objs (mapv str (.listAllObjects bp))]
+          (let [objs (mapv (comp str :key os/<-StoredObject) (.listAllObjects bp))]
             (t/is (= 4 (count (filter #(re-matches #"chunk-metadata/\p{XDigit}+\.transit.json" %) objs))))
             (t/is (= 2 (count (filter #(re-matches #"tables/public\$device_info/(.+?)/log-l00.+\.arrow" %) objs))))
             (t/is (= 4 (count (filter #(re-matches #"tables/public\$device_readings/data/log-l00.+?\.arrow" %) objs))))
@@ -341,7 +344,8 @@
 (t/deftest can-ingest-ts-devices-mini-with-stop-start-and-reach-same-state
   (let [node-dir (util/->path "target/can-ingest-ts-devices-mini-with-stop-start-and-reach-same-state")
         node-opts {:node-dir node-dir, :rows-per-chunk 1000 :rows-per-block 100
-                   :instant-src (InstantSource/system)}]
+                   :instant-src (InstantSource/system)
+                   :compactor-threads 0}]
     (util/delete-dir node-dir)
 
     (util/with-close-on-catch [node1 (tu/->local-node node-opts)]
@@ -365,7 +369,7 @@
             (.close node1)
 
             (util/with-close-on-catch [node2 (tu/->local-node (assoc node-opts :buffers-dir "objects-1"))]
-              (let [^IBufferPool bp (util/component node2 :xtdb/buffer-pool)
+              (let [^BufferPool bp (util/component node2 :xtdb/buffer-pool)
                     ^IMetadataManager mm (util/component node2 ::meta/metadata-manager)
                     lc-tx (-> first-half-tx-id
                               (tu/then-await-tx node2 (Duration/ofSeconds 10)))]
@@ -382,7 +386,7 @@
 
                   (Thread/sleep 250)    ; wait for the chunk to finish writing to disk
                                         ; we don't have an accessible hook for this, beyond awaiting the tx
-                  (let [objs (mapv str (.listAllObjects bp))]
+                  (let [objs (mapv (comp str :key os/<-StoredObject) (.listAllObjects bp))]
                     (t/is (= 5 (count (filter #(re-matches #"chunk-metadata/\p{XDigit}+\.transit.json" %) objs))))
                     (t/is (= 4 (count (filter #(re-matches #"tables/public\$device_info/(.+?)/log-l00.+\.arrow" %) objs))))
                     (t/is (= 5 (count (filter #(re-matches #"tables/public\$device_readings/data/log-l00.+?\.arrow" %) objs))))
@@ -406,7 +410,7 @@
                   (.close node2)
 
                   (with-open [node3 (tu/->local-node (assoc node-opts :buffers-dir "objects-2"))]
-                    (let [^IBufferPool bp (tu/component node3 :xtdb/buffer-pool)
+                    (let [^BufferPool bp (tu/component node3 :xtdb/buffer-pool)
                           ^IMetadataManager mm (tu/component node3 ::meta/metadata-manager)]
                       (t/is (<= first-half-tx-id
                                 (:tx-id (-> first-half-tx-id
@@ -423,7 +427,7 @@
 
                       (Thread/sleep 250); wait for the chunk to finish writing to disk
                                         ; we don't have an accessible hook for this, beyond awaiting the tx
-                      (let [objs (mapv str (.listAllObjects bp))]
+                      (let [objs (mapv (comp str :key os/<-StoredObject) (.listAllObjects bp))]
                         (t/is (= 11 (count (filter #(re-matches #"chunk-metadata/\p{XDigit}+\.transit.json" %) objs))))
                         (t/is (= 4 (count (filter #(re-matches #"tables/public\$device_info/(.+?)/log-l00-.+.arrow" %) objs))))
                         (t/is (= 11 (count (filter #(re-matches #"tables/public\$device_readings/data/log-l00-.+.arrow" %) objs))))
@@ -506,8 +510,10 @@
                                          [0, 2, "hello", 12]
                                          [1, 1, "world", 3.3]]])))
 
+          (tu/then-await-tx 0 node (Duration/ofSeconds 1))
+
           (t/is (= (serde/->TxKey 0 (time/->instant #inst "2020-01-01"))
-                   (tu/then-await-tx 0 node (Duration/ofSeconds 1))))
+                   (xtp/latest-completed-tx node)))
 
           (tu/finish-chunk! node)
 

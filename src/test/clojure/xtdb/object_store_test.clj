@@ -4,7 +4,7 @@
             [xtdb.buffer-pool :as bp]
             [xtdb.object-store :as os]
             [xtdb.util :as util])
-  (:import [java.io Closeable]
+  (:import [java.lang AutoCloseable]
            [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files Path]
@@ -22,16 +22,15 @@
   (let [^ByteBuffer buf (.encode StandardCharsets/UTF_8 (pr-str obj))]
     @(.putObject obj-store k buf)))
 
-;; Generates a byte buffer of random characters
 (defn generate-random-byte-buffer ^ByteBuffer [buffer-size]
-  (let [random         (java.util.Random.)
-        byte-buffer    (ByteBuffer/allocate buffer-size)]
+  (let [random (java.util.Random.)
+        byte-buffer (ByteBuffer/allocate buffer-size)]
     (loop [i 0]
       (if (< i buffer-size)
         (do
           (.put byte-buffer (byte (.nextInt random 128)))
           (recur (inc i)))
-        byte-buffer))))
+        (.flip byte-buffer)))))
 
 (deftype InMemoryObjectStore [^NavigableMap os]
   ObjectStore
@@ -54,14 +53,19 @@
     (.putIfAbsent os k (.slice buf))
     (CompletableFuture/completedFuture nil))
 
-  (listAllObjects [_this]
-    (vec (.keySet os)))
+  ;; these two should be returning StoredObjects, but for some reason this seems fine
+  (listAllObjects [_this] (vec (.keySet os)))
+
+  (listAllObjects [_ prefix]
+    (->> (.tailMap os prefix)
+         (take-while #(-> ^Path (key %) (.startsWith prefix)))
+         (map key)))
   
   (deleteObject [_this k]
     (.remove os k)
     (CompletableFuture/completedFuture nil))
 
-  Closeable
+  AutoCloseable
   (close [_]
     (.clear os)))
 

@@ -11,6 +11,7 @@
             [xtdb.client :as xtc]
             [xtdb.indexer :as idx]
             [xtdb.indexer.live-index :as li]
+            [xtdb.log :as xt-log]
             [xtdb.logical-plan :as lp]
             [xtdb.next.jdbc :as xt-jdbc]
             [xtdb.node :as xtn]
@@ -43,12 +44,11 @@
            (xtdb.api TransactionKey)
            xtdb.api.query.IKeyFn
            xtdb.arrow.Relation
-           xtdb.indexer.live_index.ILiveTable
+           (xtdb.indexer LiveTable Watermark Watermark$Source)
            (xtdb.query IQuerySource PreparedQuery)
            xtdb.types.ZonedDateTimeRange
            (xtdb.util RefCounter RowCounter TemporalBounds TemporalDimension)
-           (xtdb.vector IVectorReader RelationReader)
-           (xtdb.watermark IWatermarkSource Watermark)))
+           (xtdb.vector IVectorReader RelationReader)))
 
 #_{:clj-kondo/ignore [:uninitialized-var]}
 (def ^:dynamic ^org.apache.arrow.memory.BufferAllocator *allocator*)
@@ -147,16 +147,16 @@
 (defn latest-submitted-tx-id ^TransactionKey [node]
   (xtp/latest-submitted-tx-id node))
 
-;; TODO inline this now that we have `idx/await-tx`
+;; TODO inline this now that we have `log/await-tx`
 (defn then-await-tx
   (^TransactionKey [node]
-   (then-await-tx (latest-submitted-tx-id node) node nil))
+   (xt-log/await-tx node))
 
   (^TransactionKey [tx-id node]
-   (then-await-tx tx-id node nil))
+   (xt-log/await-tx node tx-id))
 
   (^TransactionKey [tx-id node timeout]
-   (idx/await-tx tx-id node timeout)))
+   (xt-log/await-tx node tx-id timeout)))
 
 (defn ->instants
   ([u] (->instants u 1))
@@ -198,7 +198,7 @@
 
 (defn finish-chunk! [node]
   (then-await-tx node)
-  (li/finish-chunk! (component node :xtdb.indexer/live-index)))
+  (li/finish-chunk! node))
 
 (defn open-vec
   (^org.apache.arrow.vector.ValueVector [col-name-or-field vs]
@@ -276,17 +276,17 @@
   ([query {:keys [allocator node args preserve-blocks? with-col-types? key-fn] :as query-opts
            :or {key-fn (serde/read-key-fn :kebab-case-keyword)
                 allocator *allocator*}}]
-   (let [indexer (util/component node :xtdb/indexer)
+   (let [{:keys [live-idx]} node
          query-opts (-> query-opts
                         (assoc :allocator allocator)
                         (cond-> node (-> (update :after-tx-id (fnil identity (xtp/latest-submitted-tx-id node)))
-                                         (doto (-> :after-tx-id (idx/await-tx node))))))
+                                         (doto (-> :after-tx-id (then-await-tx node))))))
 
          ^PreparedQuery pq (if node
                              (let [^IQuerySource q-src (util/component node ::q/query-source)]
-                               (.prepareRaQuery q-src query indexer query-opts))
+                               (.prepareRaQuery q-src query live-idx query-opts))
                              (q/prepare-ra query {:ref-ctr (RefCounter.)
-                                                  :wm-src (reify IWatermarkSource
+                                                  :wm-src (reify Watermark$Source
                                                             (openWatermark [_]
                                                               (Watermark. nil nil {})))}))]
      (util/with-open [^RelationReader args-rel (if args
@@ -316,8 +316,8 @@
 
 (defn ->local-node ^xtdb.api.Xtdb [{:keys [^Path node-dir ^String buffers-dir
                                            rows-per-chunk log-limit page-limit instant-src
-                                           compactor? healthz-port]
-                                    :or {compactor? true buffers-dir "objects" healthz-port 8080}}]
+                                           compactor-threads healthz-port]
+                                    :or {buffers-dir "objects" healthz-port 8080}}]
   (let [instant-src (or instant-src (->mock-clock))
         healthz-port (if (util/port-free? healthz-port) healthz-port (util/free-port))]
     (xtn/start-node {:healthz {:port healthz-port}
@@ -325,7 +325,8 @@
                      :storage [:local {:path (.resolve node-dir buffers-dir)}]
                      :indexer (->> {:log-limit log-limit, :page-limit page-limit, :rows-per-chunk rows-per-chunk}
                                    (into {} (filter val)))
-                     :compactor {:enabled? compactor?}})))
+                     :compactor (->> {:threads compactor-threads}
+                                     (into {} (filter val)))})))
 
 (defn with-tmp-dir* [prefix f]
   (let [dir (Files/createTempDirectory prefix (make-array FileAttribute 0))]
@@ -490,11 +491,11 @@
 (defn open-live-table [table-name]
   (li/->live-table *allocator* nil (RowCounter. 0) table-name))
 
-(defn index-tx! [^ILiveTable live-table, ^TransactionKey tx-key, docs]
+(defn index-tx! [^LiveTable live-table, ^TransactionKey tx-key, docs]
   (let [system-time (.getSystemTime tx-key)
         live-table-tx (.startTx live-table tx-key true)]
     (try
-      (let [doc-wtr (.docWriter live-table-tx)]
+      (let [doc-wtr (.getDocWriter live-table-tx)]
         (doseq [{eid :xt/id, :as doc} docs
                 :let [{:keys [:xt/valid-from :xt/valid-to],
                        :or {valid-from system-time, valid-to (time/micros->instant Long/MAX_VALUE)}} (meta doc)]]

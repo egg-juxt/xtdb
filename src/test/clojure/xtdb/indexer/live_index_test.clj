@@ -4,8 +4,8 @@
             [xtdb.api :as xt]
             [xtdb.compactor :as c]
             [xtdb.indexer.live-index :as li]
-            [xtdb.metadata :as meta]
             xtdb.node.impl
+            [xtdb.object-store :as os]
             [xtdb.serde :as serde]
             [xtdb.test-json :as tj]
             [xtdb.test-util :as tu]
@@ -16,30 +16,19 @@
            [org.apache.arrow.memory BufferAllocator RootAllocator]
            [org.apache.arrow.vector FixedSizeBinaryVector]
            [org.apache.arrow.vector.ipc ArrowFileReader]
-           (xtdb.api CompactorConfig IndexerConfig)
-           xtdb.api.storage.Storage$InMemoryStorageFactory
-           xtdb.api.log.Logs
            (xtdb.arrow Relation VectorPosition)
-           xtdb.IBufferPool
-           xtdb.indexer.live_index.ILiveIndex
+           xtdb.BufferPool
+           xtdb.indexer.LiveIndex
            (xtdb.trie ArrowHashTrie ArrowHashTrie$Leaf HashTrie MemoryHashTrie MemoryHashTrie$Leaf)))
 
-(def with-live-index
-  (partial tu/with-system {:xtdb/allocator {}
-                           :xtdb.metrics/registry nil
-                           :xtdb.indexer/live-index (IndexerConfig.)
-                           :xtdb/log (Logs/inMemoryLog)
-                           :xtdb/buffer-pool Storage$InMemoryStorageFactory/INSTANCE
-                           ::meta/metadata-manager {}
-                           :xtdb/compactor (doto (CompactorConfig.)
-                                             (.enabled false))}))
-
-(t/use-fixtures :each tu/with-allocator with-live-index)
+(t/use-fixtures :each tu/with-allocator
+  (tu/with-opts {:compactor {:threads 0}})
+  tu/with-node)
 
 (t/deftest test-chunk
-  (let [{^BufferAllocator allocator :xtdb/allocator
-         ^IBufferPool buffer-pool :xtdb/buffer-pool
-         ^ILiveIndex live-index :xtdb.indexer/live-index} tu/*sys*
+  (let [^BufferAllocator allocator (tu/component tu/*node* :xtdb/allocator)
+        ^BufferPool buffer-pool (tu/component tu/*node* :xtdb/buffer-pool)
+        ^LiveIndex live-index (tu/component tu/*node* :xtdb.indexer/live-index)
 
         iids (let [rnd (Random. 0)]
                (repeatedly 12000 #(UUID. (.nextLong rnd) (.nextLong rnd))))
@@ -50,7 +39,7 @@
     (t/testing "commit"
       (let [live-idx-tx (.startTx live-index (serde/->TxKey 0 (.toInstant #inst "2000")))
             live-table-tx (.liveTable live-idx-tx "my-table")
-            put-doc-wrt (.docWriter live-table-tx)]
+            put-doc-wrt (.getDocWriter live-table-tx)]
         (let [wp (VectorPosition/build)]
           (doseq [^UUID iid iids]
             (.logPut live-table-tx (ByteBuffer/wrap (util/uuid->bytes iid)) 0 0
@@ -72,7 +61,7 @@
                                   (mapv #(vec (.getObject iid-vec %)) (.getData leaf))))))))))
 
     (t/testing "finish chunk"
-      (li/finish-chunk! live-index)
+      (.finishChunk live-index)
 
       (let [trie-ba (.getByteArray buffer-pool (util/->path "tables/my-table/meta/log-l00-fr00-nr32ee0-rs2ee0.arrow"))
             leaf-ba (.getByteArray buffer-pool (util/->path "tables/my-table/data/log-l00-fr00-nr32ee0-rs2ee0.arrow"))]
@@ -127,28 +116,28 @@
       (util/delete-dir node-dir)
 
       (util/with-open [node (tu/->local-node {:node-dir node-dir})]
-        (let [^IBufferPool bp (tu/component node :xtdb/buffer-pool)]
+        (let [^BufferPool bp (tu/component node :xtdb/buffer-pool)]
 
           (let [{:keys [tx-id]} (last (for [tx-ops txs] (xt/execute-tx node tx-ops)))]
             (tu/then-await-tx tx-id node (Duration/ofSeconds 2)))
 
           (tu/finish-chunk! node)
 
-          (t/is (= (mapv util/->path ["tables/public$foo/data/log-l00-fr00-nr110-rs5.arrow"])
-                   (.listObjects bp (util/->path "tables/public$foo/data"))))
+          (t/is (= [(os/->StoredObject "tables/public$foo/data/log-l00-fr00-nr110-rs5.arrow" 2558)]
+                   (.listAllObjects bp (util/->path "tables/public$foo/data"))))
 
-          (t/is (= (mapv util/->path ["tables/public$foo/meta/log-l00-fr00-nr110-rs5.arrow"])
-                   (.listObjects bp (util/->path "tables/public$foo/meta")))))
+          (t/is (= [(os/->StoredObject "tables/public$foo/meta/log-l00-fr00-nr110-rs5.arrow" 4350)]
+                   (.listAllObjects bp (util/->path "tables/public$foo/meta")))))
 
         (tj/check-json (.toPath (io/as-file (io/resource "xtdb/indexer-test/can-build-live-index")))
                        (.resolve node-dir "objects"))))))
 
 (t/deftest test-new-table-discarded-on-abort-2721
-  (let [{^ILiveIndex live-index :xtdb.indexer/live-index} tu/*sys*]
+  (let [^LiveIndex live-index (tu/component tu/*node* :xtdb.indexer/live-index)]
 
     (let [live-tx0 (.startTx live-index #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-01T00:00:00Z"})
           foo-table-tx (.liveTable live-tx0 "foo")
-          doc-wtr (.docWriter foo-table-tx)]
+          doc-wtr (.getDocWriter foo-table-tx)]
       (.logPut foo-table-tx (ByteBuffer/allocate 16) 0 0
                (fn []
                  (.startStruct doc-wtr)
@@ -158,7 +147,7 @@
     (t/testing "aborting bar means it doesn't get added to the committed live-index")
     (let [live-tx1 (.startTx live-index #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-02T00:00:00Z"})
           bar-table-tx (.liveTable live-tx1 "bar")
-          doc-wtr (.docWriter bar-table-tx)]
+          doc-wtr (.getDocWriter bar-table-tx)]
       (.logPut bar-table-tx (ByteBuffer/allocate 16) 0 0
                (fn []
                  (.startStruct doc-wtr)
@@ -175,7 +164,7 @@
     (t/testing "aborting foo doesn't clear it from the live-index"
       (let [live-tx2 (.startTx live-index #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-03T00:00:00Z"})
             foo-table-tx (.liveTable live-tx2 "foo")
-            doc-wtr (.docWriter foo-table-tx)]
+            doc-wtr (.getDocWriter foo-table-tx)]
         (.logPut foo-table-tx (ByteBuffer/allocate 16) 0 0
                  (fn []
                    (.startStruct doc-wtr)
@@ -187,7 +176,7 @@
     (t/testing "committing bar after an abort adds it correctly"
       (let [live-tx3 (.startTx live-index #xt/tx-key {:tx-id 0, :system-time #xt/instant "2020-01-04T00:00:00Z"})
             bar-table-tx (.liveTable live-tx3 "bar")
-            doc-wtr (.docWriter bar-table-tx)]
+            doc-wtr (.getDocWriter bar-table-tx)]
         (.logPut bar-table-tx (ByteBuffer/allocate 16) 0 0
                  (fn []
                    (.startStruct doc-wtr)
