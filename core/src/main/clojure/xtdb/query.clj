@@ -9,6 +9,7 @@
             xtdb.expression.temporal
             [xtdb.logical-plan :as lp]
             [xtdb.metadata :as meta]
+            [xtdb.metrics :as metrics]
             xtdb.operator.apply
             xtdb.operator.arrow
             xtdb.operator.csv
@@ -26,6 +27,7 @@
             xtdb.operator.unnest
             xtdb.operator.window
             [xtdb.sql :as sql]
+            [xtdb.time :as time]
             [xtdb.types :as types]
             [xtdb.util :as util]
             [xtdb.vector.reader :as vr]
@@ -34,8 +36,9 @@
             [xtdb.xtql.plan :as xtql.plan])
   (:import clojure.lang.MapEntry
            (com.github.benmanes.caffeine.cache Cache Caffeine)
+           io.micrometer.core.instrument.Counter
            java.lang.AutoCloseable
-           (java.time Clock Duration)
+           (java.time Duration InstantSource)
            (java.util HashMap)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.function Function)
@@ -51,14 +54,12 @@
            xtdb.util.RefCounter
            xtdb.vector.IVectorReader))
 
-#_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
 (definterface BoundQuery
   (^java.util.List columnFields [])
   (^xtdb.ICursor openCursor [])
   (^void close []
    "optional: if you close this BoundQuery it'll close any closed-over args relation"))
 
-#_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
 (definterface PreparedQuery
   (^java.util.List paramFields [])
   (^java.util.List columnFields [])
@@ -71,7 +72,6 @@
     args :: RelationReader
       N.B. `args` will be closed when this BoundQuery closes"))
 
-#_{:clj-kondo/ignore [:unused-binding :clojure-lsp/unused-public-var]}
 (definterface IQuerySource
   (^xtdb.query.PreparedQuery prepareRaQuery [ra-query query-opts])
   (^xtdb.query.PreparedQuery prepareRaQuery [ra-query wm-src query-opts])
@@ -80,13 +80,15 @@
   (^clojure.lang.PersistentVector planQuery [query wm-src query-opts]))
 
 (defn- wrap-cursor ^xtdb.IResultCursor [^ICursor cursor, ^AutoCloseable wm, ^BufferAllocator al,
-                                        ^Clock clock, ^RefCounter ref-ctr fields]
+                                        current-time, snapshot-time, default-tz, ^RefCounter ref-ctr, fields]
   (reify IResultCursor
     (tryAdvance [_ c]
       (when (.isClosing ref-ctr)
         (throw (InterruptedException.)))
 
-      (binding [expr/*clock* clock]
+      (binding [expr/*clock* (InstantSource/fixed current-time)
+                expr/*snapshot-time* snapshot-time
+                expr/*default-tz* default-tz]
         (.tryAdvance cursor c)))
 
     (characteristics [_] (.characteristics cursor))
@@ -111,13 +113,12 @@
                                     (with-open [wm (.openWatermark wm-src)]
                                       (.scanFields scan-emitter wm scan-cols)))
                      :default-tz default-tz
-                     :last-known-chunk (when metadata-mgr
-                                         (.lastEntry (.chunksMetadata metadata-mgr)))
+                     :last-known-block (when metadata-mgr
+                                         (.lastEntry (.blocksMetadata metadata-mgr)))
                      :param-fields param-fields}
                     (reify Function
                       (apply [_ emit-opts]
-                        (binding [expr/*clock* (Clock/fixed (.instant expr/*clock*) default-tz)]
-                          ;; only the tz in the clock is relevant at expr compile time
+                        (binding [expr/*default-tz* default-tz]
                           (lp/emit-expr conformed-query (assoc emit-opts :scan-emitter scan-emitter)))))))
 
 (defn ->column-fields [ordered-outer-projection fields]
@@ -175,7 +176,7 @@
                                             (map-indexed (fn [idx field]
                                                            (types/field-with-name field (str "?_" idx)))))))
            param-fields-by-name (into {} (map (juxt (comp symbol #(.getName ^Field %)) identity)) param-fields)
-           default-tz (or default-tz (.getZone expr/*clock*))]
+           default-tz (or default-tz expr/*default-tz*)]
 
        (reify PreparedQuery
          (paramFields [_] param-fields)
@@ -191,8 +192,8 @@
 
            ;; TODO throw if basis is in the future?
            (let [{:keys [fields ->cursor]} (emit-expr cache deps conformed-query scan-cols default-tz (->arg-fields args))
-                 current-time (or current-time (.instant expr/*clock*))
-                 clock (Clock/fixed current-time default-tz)]
+                 current-time (or (some-> current-time time/->instant)
+                                  (expr/current-time))]
 
              (reify
                BoundQuery
@@ -220,15 +221,17 @@
                                               (RootAllocator.))
                                             wm (.openWatermark wm-src)]
                    (try
-                     (binding [expr/*clock* clock]
+                     (binding [expr/*clock* (InstantSource/fixed current-time)
+                               expr/*default-tz* default-tz
+                               expr/*snapshot-time* (or (some-> snapshot-time time/->instant)
+                                                        (some-> wm .getTxBasis .getSystemTime))]
                        (-> (->cursor {:allocator allocator, :watermark wm
-                                      :clock clock,
                                       :default-tz default-tz,
-                                      :snapshot-time (or snapshot-time (some-> wm .getTxBasis .getSystemTime))
+                                      :snapshot-time expr/*snapshot-time*
                                       :current-time current-time
                                       :args (or args vw/empty-args)
                                       :schema (scan/tables-with-cols wm-src)})
-                           (wrap-cursor wm allocator clock ref-ctr fields)))
+                           (wrap-cursor wm allocator current-time expr/*snapshot-time* default-tz ref-ctr fields)))
 
                      (catch Throwable t
                        (.release ref-ctr) 
@@ -246,25 +249,28 @@
           :allocator (ig/ref :xtdb/allocator)
           :scan-emitter (ig/ref ::scan/scan-emitter)
           :metadata-mgr (ig/ref ::meta/metadata-manager)
-          :live-idx (ig/ref :xtdb.indexer/live-index)}))
+          :live-idx (ig/ref :xtdb.indexer/live-index)
+          :metrics-registry (ig/ref :xtdb.metrics/registry)}))
 
 (defn ->caffeine-cache ^com.github.benmanes.caffeine.cache.Cache [size]
   (-> (Caffeine/newBuilder) (.maximumSize size) (.build)))
 
-(defmethod ig/init-key ::query-source [_ {:keys [plan-cache-size live-idx] :as deps}]
+(defmethod ig/init-key ::query-source [_ {:keys [plan-cache-size live-idx metrics-registry] :as deps}]
   (let [plan-cache (->caffeine-cache plan-cache-size)
         ref-ctr (RefCounter.)
-        deps (-> deps (assoc :ref-ctr ref-ctr))]
+        deps (-> deps (assoc :ref-ctr ref-ctr))
+        query-warning-counter ^Counter (metrics/add-counter metrics-registry "query.warning")]
     (reify
       IQuerySource
       (prepareRaQuery [this query query-opts]
         (.prepareRaQuery this query live-idx query-opts))
       (prepareRaQuery [_ query wm-src query-opts]
-        (prepare-ra query (assoc deps :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src))))
-
+        (let [prepared-query (prepare-ra query (assoc deps :wm-src wm-src) (assoc query-opts :table-info (scan/tables-with-cols wm-src)))]
+          (when (seq (.warnings prepared-query))
+            (.increment query-warning-counter))
+          prepared-query))
       (planQuery [this query query-opts]
         (.planQuery this query live-idx query-opts))
-
       (planQuery [_ query wm-src query-opts]
         (let [table-info (scan/tables-with-cols wm-src)
               plan-query-opts
@@ -309,13 +315,36 @@
                             (apply [_ k]
                               (.denormalize key-fn k))))))))
 
-(defn open-cursor-as-stream ^java.util.stream.Stream [^BoundQuery bound-query {:keys [key-fn]}]
-  (let [key-fn (cache-key-fn key-fn)]
-    (util/with-close-on-catch [cursor (.openCursor bound-query)]
-      (-> (StreamSupport/stream cursor false)
-          ^Stream (.onClose (fn []
-                              (util/close cursor)
-                              (util/close bound-query)))
-          (.flatMap (reify Function
-                      (apply [_ rel]
-                        (.stream (vr/rel->rows rel key-fn)))))))))
+(defn wrapping-error-count-cursor [^IResultCursor source ^Counter query-error-counter]
+  (reify IResultCursor
+    (tryAdvance [_ c]
+      (try
+        (.tryAdvance source c)
+        (catch Exception e
+          (when query-error-counter
+            (.increment query-error-counter))
+          (throw e))))
+
+    (characteristics [_] (.characteristics source))
+    (estimateSize [_] (.estimateSize source))
+    (getComparator [_] (.getComparator source))
+    (getExactSizeIfKnown [_] (.getExactSizeIfKnown source))
+    (hasCharacteristics [_ c] (.hasCharacteristics source c))
+    (trySplit [_] (.trySplit source))
+    (close [_] (.close source))
+    (columnFields [_] (.columnFields source))))
+
+(defn open-cursor-as-stream
+  (^java.util.stream.Stream [^BoundQuery bound-query query-opts]
+   (open-cursor-as-stream bound-query query-opts {}))
+  (^java.util.stream.Stream [^BoundQuery bound-query {:keys [key-fn]} {:keys [^Counter query-error-counter]}]
+   (let [key-fn (cache-key-fn key-fn)]
+     (util/with-close-on-catch [cursor (.openCursor bound-query)]
+       (-> (StreamSupport/stream (cond-> cursor
+                                   query-error-counter (wrapping-error-count-cursor query-error-counter)) false)
+           ^Stream (.onClose (fn []
+                               (util/close cursor)
+                               (util/close bound-query)))
+           (.flatMap (reify Function
+                       (apply [_ rel]
+                         (.stream (vr/rel->rows rel key-fn))))))))))

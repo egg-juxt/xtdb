@@ -25,7 +25,7 @@
            (java.nio ByteBuffer)
            (java.sql Array Connection PreparedStatement ResultSet SQLWarning Statement Timestamp Types)
            (java.time Clock Instant LocalDate LocalDateTime OffsetDateTime ZoneId ZoneOffset)
-           (java.util Arrays Calendar List TimeZone UUID)
+           (java.util Arrays Calendar Date List TimeZone UUID)
            (java.util.concurrent CountDownLatch TimeUnit)
            (org.pg.codec CodecParams)
            (org.pg.enums OID)
@@ -969,7 +969,7 @@
 (t/deftest test-setting-basis-current-time-3505
   (with-open [conn (jdbc-conn)]
     (is (= [{:ts #inst "2020-01-01"}]
-           (q conn ["SETTING CURRENT_TIME = TIMESTAMP '2020-01-01T00:00:00Z'
+           (q conn ["SETTING CLOCK_TIME = TIMESTAMP '2020-01-01T00:00:00Z'
                      SELECT CURRENT_TIMESTAMP AS ts"])))
 
     (q conn ["INSERT INTO foo (_id, version) VALUES ('foo', 0)"])
@@ -988,7 +988,7 @@
              :xt/valid-from #inst "2020-01-01T00:00:00.000000000-00:00"
              :ts #inst "2024-01-01"}]
            (q conn ["SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z',
-                             CURRENT_TIME = TIMESTAMP '2024-01-01T00:00:00Z'
+                             CLOCK_TIME = TIMESTAMP '2024-01-01T00:00:00Z'
                      SELECT version, _valid_from, _valid_to, CURRENT_TIMESTAMP ts FROM foo"]))
         "both snapshot and current time")
 
@@ -1023,7 +1023,7 @@
     (let [sql #(q conn [%])]
       (t/testing "as part of START TRANSACTION"
         (sql "SET TIME ZONE 'Europe/London'")
-        (sql "START TRANSACTION READ WRITE, AT SYSTEM_TIME DATE '2021-08-01'")
+        (sql "START TRANSACTION READ WRITE WITH (SYSTEM_TIME DATE '2021-08-01')")
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 0)")
         (sql "COMMIT")
 
@@ -1032,7 +1032,7 @@
                (q conn ["SELECT version, _system_from FROM foo"]))))
 
       (t/testing "with BEGIN"
-        (sql "BEGIN READ WRITE, AT SYSTEM_TIME TIMESTAMP '2021-08-03T00:00:00'")
+        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '2021-08-03T00:00:00')")
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 1)")
         (sql "COMMIT")
 
@@ -1043,7 +1043,7 @@
                (q conn ["SELECT version, _system_from FROM foo FOR ALL VALID_TIME ORDER BY version"]))))
 
       (t/testing "past system time"
-        (sql "BEGIN READ WRITE, AT SYSTEM_TIME TIMESTAMP '2021-08-02T00:00:00Z'")
+        (sql "BEGIN READ WRITE WITH (SYSTEM_TIME TIMESTAMP '2021-08-02T00:00:00Z')")
         (sql "INSERT INTO foo (_id, version) VALUES ('foo', 2)")
         (t/is (thrown-with-msg? PSQLException #"specified system-time older than current tx"
                                 (sql "COMMIT")))))))
@@ -2433,12 +2433,12 @@ ORDER BY t.oid DESC LIMIT 1"
   (with-open [conn (jdbc-conn)]
     (exec conn "SET TIME ZONE 'UTC'")
 
-    (jdbc/execute! conn ["BEGIN AT SYSTEM_TIME DATE '2020-01-01'"])
+    (jdbc/execute! conn ["BEGIN READ WRITE WITH (SYSTEM_TIME = DATE '2020-01-01')"])
     (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1}"])
     (jdbc/execute! conn ["COMMIT"])
 
     (t/testing "earlier sys-time"
-      (jdbc/execute! conn ["BEGIN AT SYSTEM_TIME DATE '2019-01-01'"])
+      (jdbc/execute! conn ["BEGIN READ WRITE WITH (SYSTEM_TIME = DATE '2019-01-01')"])
       (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 2}"])
       (t/is (thrown? PSQLException (jdbc/execute! conn ["COMMIT"]))))
 
@@ -2482,29 +2482,9 @@ ORDER BY t.oid DESC LIMIT 1"
       (pg/execute conn "SELECT pg_sleep_for('0.01 minute')")
       (t/is (< 160 (- (System/currentTimeMillis) start))))))
 
-(t/deftest test-display-tables-query
-  (with-open [conn (jdbc-conn)]
-    (t/is (=
-           ["columns"
-            "pg_am"
-            "pg_attribute"
-            "pg_class"
-            "pg_database"
-            "pg_description"
-            "pg_matviews"
-            "pg_namespace"
-            "pg_proc"
-            "pg_range"
-            "pg_settings"
-            "pg_stat_user_tables"
-            "pg_tables"
-            "pg_type"
-            "pg_user"
-            "pg_views"
-            "schemata"
-            "tables"]
-           (map :Name
-                (q conn ["SELECT n.nspname as \"Schema\",
+(def display-tables-query
+  "
+SELECT n.nspname as \"Schema\",
   c.relname as \"Name\",
   CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'i' THEN 'index' WHEN 'S' THEN 'sequence' WHEN 't' THEN 'TOAST table' WHEN 'f' THEN 'foreign table' WHEN 'p' THEN 'partitioned table' WHEN 'I' THEN 'partitioned index' END as \"Type\",
   pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"
@@ -2516,30 +2496,84 @@ WHERE c.relkind IN ('r','p','')
       AND n.nspname !~ '^pg_toast'
       AND n.nspname <> 'information_schema'
   AND pg_catalog.pg_table_is_visible(c.oid)
-ORDER BY 1,2;"]))))))
+ORDER BY 1,2;")
+
+(t/deftest test-display-tables-query
+  (with-open [conn (jdbc-conn)]
+    (jdbc/execute! conn ["INSERT INTO foo RECORDS {_id: 1}"])
+    (jdbc/execute! conn ["INSERT INTO bar RECORDS {_id: 2}"])
+
+    (t/is (= [["public" "bar"]
+              ["public" "foo"]]
+           (map (juxt :Schema :Name)
+                (q conn [display-tables-query]))))))
 
 (t/deftest test-display-tables-psql
   (when (psql-available?)
     (psql-session
      (fn [send read]
+       (send "INSERT INTO foo RECORDS {_id: 1};\n")
+       (t/is (= [["INSERT 0 0"]] (read)))
+
        (send "\\d\n")
        (t/is (= [["Schema" "Name" "Type" "Owner"]
-                 ["public" "columns" "table" "xtdb"]
-                 ["public" "pg_am" "table" "xtdb"]
-                 ["public" "pg_attribute" "table" "xtdb"]
-                 ["public" "pg_class" "table" "xtdb"]
-                 ["public" "pg_database" "table" "xtdb"]
-                 ["public" "pg_description" "table" "xtdb"]
-                 ["public" "pg_matviews" "table" "xtdb"]
-                 ["public" "pg_namespace" "table" "xtdb"]
-                 ["public" "pg_proc" "table" "xtdb"]
-                 ["public" "pg_range" "table" "xtdb"]
-                 ["public" "pg_settings" "table" "xtdb"]
-                 ["public" "pg_stat_user_tables" "table" "xtdb"]
-                 ["public" "pg_tables" "table" "xtdb"]
-                 ["public" "pg_type" "table" "xtdb"]
-                 ["public" "pg_user" "table" "xtdb"]
-                 ["public" "pg_views" "table" "xtdb"]
-                 ["public" "schemata" "table" "xtdb"]
-                 ["public" "tables" "table" "xtdb"]]
+                 ["public" "foo" "table" "xtdb"]]
                 (read)))))))
+
+(t/deftest select-snapshot-time
+  (with-open [conn (jdbc-conn)]
+    (t/is (= [{:ts nil}] (jdbc/execute! conn ["SELECT SNAPSHOT_TIME ts"]))
+          "before any transactions")
+
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 1, :x 3}]])
+
+    (t/is (= [{:ts #inst "2020-01-01"}]
+             (jdbc/execute! conn ["SELECT SNAPSHOT_TIME ts"])))
+
+    (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id 2, :x 5}]])
+
+    (t/is (= [{:snapshot_time #inst "2020-01-02"}]
+             (jdbc/execute! conn ["SHOW SNAPSHOT_TIME"])))
+
+    (let [sql "SELECT SNAPSHOT_TIME ts, * FROM docs ORDER BY _id"]
+      (t/is (= [{:ts #inst "2020-01-02", :_id 1, :x 3}
+                {:ts #inst "2020-01-02", :_id 2, :x 5}]
+               (jdbc/execute! conn [sql])))
+
+      (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
+               (jdbc/execute! conn [(str "SETTING SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z' " sql)])))
+
+      (t/testing "in tx"
+        (jdbc/execute! conn ["BEGIN READ ONLY WITH (SNAPSHOT_TIME = TIMESTAMP '2020-01-01T00:00:00Z', CLOCK_TIME = TIMESTAMP '2020-01-04T00:00:00Z')"])
+        (try
+          (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
+                   (jdbc/execute! conn [sql])))
+
+          (t/is (= [{:ts #inst "2020-01-01", :_id 1, :x 3}]
+                   (jdbc/execute! conn [sql]))
+                "once more for luck")
+
+          (t/is (= {:clock_time #inst "2020-01-04"} (jdbc/execute-one! conn ["SHOW CLOCK_TIME"])))
+
+          (finally
+            (jdbc/execute! conn ["ROLLBACK"])))))))
+
+(t/deftest show-clock-time
+  (with-open [conn (jdbc-conn)]
+    (t/testing "defaults to now"
+      (let [before (Instant/now)
+            ct (-> (jdbc/execute-one! conn ["SHOW CLOCK_TIME"])
+                   :clock_time
+                   (time/->instant))
+            after (Instant/now)]
+        (t/is (.isBefore before ct))
+        (t/is (.isAfter after ct))))
+
+    (t/testing "setting on tx"
+      (jdbc/execute! conn ["BEGIN READ ONLY WITH (CLOCK_TIME = TIMESTAMP '2024-01-01T00:00:00Z')"])
+      (try
+          (t/is (= [{:clock_time #inst "2024-01-01"}]
+                   (jdbc/execute! conn ["SHOW CLOCK_TIME"])))
+
+          (finally
+            (jdbc/execute! conn ["ROLLBACK"]))))))

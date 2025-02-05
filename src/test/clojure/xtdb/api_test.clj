@@ -656,7 +656,7 @@ VALUES (2, DATE '2022-01-01', DATE '2021-01-01')"])
   people.1
   [:scan
    {:table public/people}
-   [age name _valid_from _valid_to {_id (= _id ?_0)}]]]]
+   [_valid_from {_id (= _id ?_0)} age name _valid_to]]]]
 "}]
            (xt/q tu/*node*
                  "SELECT name, age, _valid_from, _valid_to FROM people WHERE _id = ?"
@@ -760,7 +760,7 @@ VALUES (2, DATE '2022-01-01', DATE '2021-01-01')"])
     (t/is (= expected (set (xt/q tu/*node* "SELECT * FROM foo"))))
 
     (when (= tu/*node-type* :in-memory)
-      (tu/finish-chunk! tu/*node*)
+      (tu/finish-block! tu/*node*)
       (c/compact-all! tu/*node* #xt/duration "PT2S")
 
       (t/is (= expected (set (xt/q tu/*node* "SELECT * FROM foo")))))))
