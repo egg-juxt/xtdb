@@ -64,6 +64,7 @@ allprojects {
     repositories {
         mavenCentral()
         maven { url = uri("https://repo.clojars.org/") }
+        maven { url = uri("https://jitpack.io") }
     }
 
     if (plugins.hasPlugin("java-library")) {

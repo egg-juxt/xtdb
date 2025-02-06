@@ -7,8 +7,7 @@
             [mount.core :as mount :refer [defstate]]
             [xtdb.api :as xt]
             [xtdb.node :as xtnode]
-            [xtdb.util :as xtutil]
-            [xtdb.test-util :refer [finish-chunk!]])
+            [xtdb.util :as xtutil])
   (:import (java.nio.file CopyOption Files Path)
            (java.time LocalDate)))
 
@@ -305,8 +304,6 @@
                                  :to (t/local-date-time 2024 7 1 0 0)}) ; => 216000
 
   (def my-node node-small)
-
-  (finish-chunk! my-node) ; doesn't have an effect on the issue showing up or not
 
   ; Correct
   (->> (xt/q my-node

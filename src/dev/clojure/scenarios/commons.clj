@@ -53,7 +53,8 @@
           batch (partition-all max-batch-size part-by-system-time)]
       (let [tx-ops (apply concat (map first batch))
             tx-opts (-> batch first second)
-            _ (println "submits" (swap! submitted-count (partial + (count batch))))]
+            new-submitted-count (swap! submitted-count (partial + (count batch)))]
+        (println "submits" new-submitted-count)
         [tx-ops tx-opts]))))
 
 
@@ -101,13 +102,15 @@
 (defn rm-dataset! [name]
   (sh "rm" "-rf" (str "datasets/" name)))
 
-(defn restart-small! []
+(defn reset-small! []
   (mount/stop #'node-small)
   (rm-dataset! "small")
   (mount/start #'node-small)
   (set-node! node-small))
 
 (comment
+  (reset-small!)
+
   (mount/stop #'node-small)
   (rm-dataset! "small")
 
