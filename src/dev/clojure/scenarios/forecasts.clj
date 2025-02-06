@@ -1,6 +1,6 @@
 (ns scenarios.forecasts
   (:require [java-time.api :as t]
-            [scenarios.commons :as commons :refer [make-node-conf *node* batch-submits for-valid-time interleave-submits-2 render-sql]]
+            [scenarios.commons :as commons :refer [make-node-conf *node* execute-tx! batch-submits for-valid-time interleave-submits-2 render-sql]]
             [scenarios.load-test :refer [periodic-instants]]
             [xtdb.api :as xt]
             [mount.core :as mount :refer [defstate]]
@@ -146,7 +146,8 @@
 
 (defn submit-in-batches! [node s]
   (doseq [submit (batch-submits 10000 s)]
-    (apply xt/submit-tx node submit)))
+    (binding [*node* node]
+      (apply execute-tx! submit))))
 
 (comment
   ; seeding

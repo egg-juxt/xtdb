@@ -117,3 +117,15 @@
   (mount/start #'node-small)
   (set-node! node-small)
   (xt/status *node*))
+
+
+; Util
+
+(defn execute-tx!
+  ([tx-ops]
+   (xt/execute-tx *node* tx-ops {}))
+  ([tx-ops tx-opts]
+   (let [tx-result (xt/execute-tx *node* tx-ops tx-opts)]
+     (assert (:committed? tx-result)
+       (str "tx not commited" (when-let [error (:error tx-result)]
+                                (str " with error " error)))))))
