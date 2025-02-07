@@ -1,11 +1,7 @@
 (ns scenarios.issues
   (:require [java-time.api :as t]
-            [scenarios.commons :as commons :refer [reset-small! make-node-conf *node* batch-submits for-valid-time interleave-submits-2 render-sql]]
-            [scenarios.load-test :refer [periodic-instants]]
-            [xtdb.api :as xt]
-            [mount.core :as mount :refer [defstate]]
-            [xtdb.node :as xtnode]
-            [xtdb.util :as xtutil]))
+            [scenarios.commons :refer [*node* reset-small!]]
+            [xtdb.api :as xt]))
 
 (comment
   ; Is this a gotcha?

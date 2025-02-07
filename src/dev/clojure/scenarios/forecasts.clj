@@ -1,9 +1,8 @@
 (ns scenarios.forecasts
   (:require [java-time.api :as t]
-            [scenarios.commons :as commons :refer [make-node-conf *node* execute-tx! batch-submits for-valid-time interleave-submits-2 render-sql]]
-            [scenarios.load-test :refer [periodic-instants]]
-            [xtdb.api :as xt]
             [mount.core :as mount :refer [defstate]]
+            [scenarios.commons :refer [*node* batch-submits execute-tx! for-valid-time interleave-submits-2 make-node-conf periodic-instants render-sql reset-small!]]
+            [xtdb.api :as xt]
             [xtdb.node :as xtnode]
             [xtdb.util :as xtutil]))
 

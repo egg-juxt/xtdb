@@ -40,11 +40,18 @@
         (cond
           (t/not-after? d1 d2)
           (cons (first submits-1)
-            (interleave-submits-2 (rest submits-1) submits-2))
+                (interleave-submits-2 (rest submits-1) submits-2))
 
           :else
           (cons (first submits-2)
-            (interleave-submits-2 submits-1 (rest submits-2))))))))
+                (interleave-submits-2 submits-1 (rest submits-2))))))))
+
+(comment
+  (interleave-submits-2
+    [[[:put-docs {:into :site} {:xt/id "site2"}] {:system-time (t/instant "2024-01-02T00:00:00Z")}]
+     [[:put-docs {:into :site} {:xt/id "site4"}] {:system-time (t/instant "2024-01-04T00:00:00Z")}]]
+    [[[:put-docs {:into :site} {:xt/id "site1"}] {:system-time (t/instant "2024-01-01T00:00:00Z")}]
+     [[:put-docs {:into :site} {:xt/id "site5"}] {:system-time (t/instant "2024-01-05T00:00:00Z")}]]))
 
 ; TODO batch single ops (now batching full tx-ops, as received)
 (defn batch-submits [max-batch-size submits]
@@ -58,29 +65,11 @@
         [tx-ops tx-opts]))))
 
 
-;;; Nodes
-
-(defn make-node-conf [node-name]
-  #spy/d {:log [:local {:path (io/file "datasets" node-name "log")}]
-          :storage [:local {:path (io/file "datasets" node-name "objects")}]})
-
-(defstate ^{:on-reload :noop}
-  node-load1
-  "Node with random system readings for year 2024, for 1000 systems"
-  :start (xtnode/start-node (make-node-conf "load1"))
-  :stop (xtutil/close node-load1))
-
-(defstate ^{:on-reload :noop}
-  node-small
-  "Node for small tests"
-  :start (xtnode/start-node (make-node-conf "small"))
-  :stop (xtutil/close node-small))
-
 ;; Nodes
 
 (defn make-node-conf [node-name]
-  #spy/d {:log [:local {:path (io/file "datasets" node-name "log")}]
-          :storage [:local {:path (io/file "datasets" node-name "objects")}]})
+  {:log [:local {:path (io/file "datasets" node-name "log")}]
+   :storage [:local {:path (io/file "datasets" node-name "objects")}]})
 
 (defstate ^{:on-reload :noop}
   node-load1
@@ -129,3 +118,18 @@
      (assert (:committed? tx-result)
        (str "tx not commited" (when-let [error (:error tx-result)]
                                 (str " with error " error)))))))
+
+(defn periodic-instants [duration from-local-date to-local-date]
+  (->> (iterate #(t/plus % duration) from-local-date)
+    (take-while #(t/not-after? % to-local-date))
+    (map #(t/instant % (t/zone-id "UTC")))))
+
+(comment
+  (take 10 (periodic-instants
+             (t/duration 5 :minutes)
+             (t/local-date-time 2024 1 1 0 0)
+             (t/local-date-time 2024 1 15 0 0)))
+  (take-last 10 (periodic-instants
+                  (t/duration 5 :minutes)
+                  (t/local-date-time 2024 1 1 0 0)
+                  (t/local-date-time 2024 1 15 0 0))))
