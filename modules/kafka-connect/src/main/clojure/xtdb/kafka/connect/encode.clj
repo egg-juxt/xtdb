@@ -47,14 +47,12 @@
       (-> schema .type (= Schema$Type/MAP))
       (if-not (map? data)
         (throw (IllegalArgumentException. "expected Map"))
-        (reduce-kv
-          (fn [m k v]
-            (let [subpath (conj path (name k))]
-              (assoc m
-                (encode-by-schema* (.keySchema schema) k subpath)
-                (encode-by-schema* (.valueSchema schema) v subpath))))
-          {}
-          data))
+        (->> data
+             (map (fn [[k v]]
+                    (let [subpath (conj path (name k))]
+                      [(encode-by-schema* (.keySchema schema) k subpath)
+                       (encode-by-schema* (.valueSchema schema) v subpath)])))
+             (into {})))
 
       (-> schema .type (= Schema$Type/ARRAY))
       (if-not (or (sequential? data)
@@ -81,7 +79,8 @@
                  e))))))
 
 (defn encode-by-schema [^Schema schema, data]
-  (log/debug "encoding data" data "following schema" schema)
+  (log/debug "encoding data of type" (type data) "following schema" schema)
+  (log/trace "encoding data:" data)
   (encode-by-schema* schema data []))
 
 (defn ^ConnectRecord encode-record-value-by-schema [^ConnectRecord record]

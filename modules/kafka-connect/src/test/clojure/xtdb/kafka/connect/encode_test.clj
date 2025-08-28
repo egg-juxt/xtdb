@@ -51,6 +51,7 @@
                                :value-value value})
 
         encoded-record (encode/encode-record-value-by-schema record)]
+    (is (= nil (.valueSchema encoded-record)))
     (with-open [node (xtn/start-node)]
       (xt/execute-tx node [[:put-docs :my-table (-> encoded-record
                                                     .value
