@@ -61,16 +61,10 @@
 
 (defrecord Server [^BufferAllocator allocator
                    port read-only? playground?
-
-                   ^ServerSocket accept-socket
-                   ^Thread accept-thread
-
+                   ^ServerSocket accept-socket, ^Thread accept-thread
                    ^ExecutorService thread-pool
-
                    !closing?
-
                    server-state
-
                    ^Authenticator authn]
   DataSource
   (createConnectionBuilder [_]
@@ -79,11 +73,10 @@
   XtdbModule
   (close [_]
     (when (compare-and-set! !closing? false true)
-      (when-not (#{Thread$State/NEW, Thread$State/TERMINATED} (.getState accept-thread))
-        (log/trace "Closing accept thread")
-        (.interrupt accept-thread)
-        (when-not (.join accept-thread (Duration/ofSeconds 5))
-          (log/error "Could not shut down accept-thread gracefully" {:port port, :thread (.getName accept-thread)})))
+      (log/trace "Closing accept socket")
+      (.close accept-socket)
+      (when-not (.join accept-thread (Duration/ofSeconds 5))
+        (log/error "Could not shut down accept-thread gracefully" {:port port, :thread (.getName accept-thread)}))
 
       (let [drain-wait (:drain-wait @server-state 5000)]
         (when-not (contains? #{0, nil} drain-wait)
@@ -1840,37 +1833,21 @@
         (when-not (realized? close-promise)
           (deliver close-promise true))))))
 
-(defn- accept-loop [{:keys [^ServerSocket accept-socket, ^ExecutorService thread-pool] :as server}]
-  (try
-    (loop []
-      (cond
-        (Thread/interrupted) (throw (InterruptedException.))
-
-        (.isClosed accept-socket)
-        (log/trace "Accept socket closed, exiting accept loop")
-
-        :else
-        (do
-          (try
-            (let [conn-socket (.accept accept-socket)]
-              (.setTcpNoDelay conn-socket true)
-              ;; TODO fix buffer on tp? q gonna be infinite right now
-              (.submit thread-pool ^Runnable (fn [] (connect server conn-socket))))
-            (catch SocketException e
-              (when (and (not (.isClosed accept-socket))
-                         (not= "Socket closed" (.getMessage e)))
-                (log/warn e "Accept socket exception")))
-            (catch IOException e
-              (log/warn e "Accept IO exception")))
-          (recur))))
-
-    (catch Interrupted _)
-    (catch InterruptedException _)
-
-    (finally
-      (util/try-close accept-socket)))
-
-  (log/trace "exiting accept loop"))
+(defn- accept-loop [{:keys [^ServerSocket accept-socket, ^ExecutorService thread-pool, !closing?] :as server}]
+  (while (not (.isClosed accept-socket))
+    (try
+      (let [conn-socket (doto (.accept accept-socket)
+                          (.setTcpNoDelay true))]
+        ;; TODO fix buffer on tp? q gonna be infinite right now
+        (.submit thread-pool ^Runnable (fn []
+                                         (connect server conn-socket))))
+      (catch IOException e
+        (when-not (and @!closing?
+                       (instance? SocketException e)
+                       (= "Socket closed" (.getMessage e)))
+          (log/warn e "Error while accepting connections")
+          (Thread/sleep 3000)))))
+  (log/debug "Accept socket closed, exiting accept loop"))
 
 (defn serve
   "Creates and starts a PostgreSQL wire-compatible server.
