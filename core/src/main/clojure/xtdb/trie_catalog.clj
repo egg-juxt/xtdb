@@ -2,6 +2,7 @@
   (:require [clojure.tools.logging :as log]
             [clojure.spec.alpha :as s]
             [integrant.core :as ig]
+            [xtdb.metrics :as metrics]
             [xtdb.table-catalog :as table-cat]
             [xtdb.time :as time]
             [xtdb.trie :as trie]
@@ -542,7 +543,15 @@
         (.addTries cat table tries now))
       (:table-cats @(:!state cat)))))
 
-(defmethod ig/init-key :xtdb/trie-catalog [_ {:keys [^BufferPool buffer-pool, ^BlockCatalog block-cat]}]
+(defn count-tries [^TrieCatalog cat trie-state]
+  (transduce (comp (mapcat (comp vals :tries))
+                   (map (comp count trie-state)))
+             +
+             0
+             (-> cat :!state deref :table-cats vals)))
+
+(defmethod ig/init-key :xtdb/trie-catalog [_ {{:keys [meter-registry]} :base
+                                              :keys [^BufferPool buffer-pool, ^BlockCatalog block-cat, db-name]}]
   (log/debug "starting trie catalog...")
   (let [table->table-block (table-cat/load-tables-to-metadata buffer-pool block-cat)
         block-idx (or (.getCurrentBlockIndex block-cat) -1)
@@ -550,5 +559,10 @@
                           (volatile! {:block-idx block-idx
                                       :table-cats (load-tries table->table-block *file-size-target*)})
                           *file-size-target*)]
+    (when meter-registry
+      (doseq [trie-state [:live :nascent :garbage]]
+        (metrics/add-gauge meter-registry "xtdb.trie.count" #(double (count-tries cat trie-state))
+                           {:tags {:db db-name
+                                   :state (name trie-state)}})))
     (log/debug "trie catalog started")
     cat))

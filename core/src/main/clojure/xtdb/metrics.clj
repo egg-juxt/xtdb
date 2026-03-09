@@ -45,12 +45,13 @@
 
 (defn add-gauge
   ([reg meter-name f] (add-gauge reg meter-name f {}))
-  ([^MeterRegistry reg meter-name f {:keys [unit tag]}]
+  ([^MeterRegistry reg meter-name f {:keys [unit tag tags]}]
    (let [[tag-key tag-value] tag]
      (-> (Gauge/builder meter-name f)
          (cond->
-             unit (.baseUnit (str unit))
-             tag (.tag tag-key tag-value))
+           unit (.baseUnit (str unit))
+           tag (.tag tag-key tag-value)
+           tags (.tags ^Iterable (for [[k v] tags] (Tag/of (name k) v))))
          (.register reg)))))
 
 (defn- register-gauge! [^MeterRegistry reg, ^Gauge$Builder g]
