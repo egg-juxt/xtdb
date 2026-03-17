@@ -1766,80 +1766,73 @@
 
                 (recur))))))
 
-(defn- connect
+(defn- connect*
   "Starts and runs a connection on the current thread until it closes.
 
   The connection exiting for any reason (either because the connection, received a close signal, or the server is draining, or unexpected error) should result in connection resources being
   freed at the end of this function. So the connections lifecycle should be totally enclosed over the lifetime of a connect call.
 
   See comment 'Connection lifecycle'."
-  [{:keys [node, ^Authenticator authn, server-state, port, allocator, query-error-counter, tx-error-counter, ^Counter total-connections-counter, ^Counter cancelled-connections-counter, query-timer, query-tracer] :as server} ^Socket conn-socket]
-  (let [close-promise (promise)
-        {:keys [cid !closing?] :as conn} (util/with-close-on-catch [_ conn-socket]
-                                           (let [cid (:next-cid (swap! server-state update :next-cid (fnil inc 0)))
-                                                 !conn-state (atom {:close-promise close-promise
-                                                                    :session {:access-mode :read-only
-                                                                              :clock (:clock @server-state)}})
-                                                 !closing? (atom false)]
-                                             (log/debug "New connection" {:cid cid})
-                                             (try
+  [{:keys [node, ^Authenticator authn, server-state, allocator, query-error-counter, tx-error-counter, ^Counter total-connections-counter, ^Counter cancelled-connections-counter, query-timer, query-tracer] :as server}
+   ^Socket conn-socket, cid]
+  (try
+    (let [close-promise (promise)
+          {:keys [cid !closing?] :as conn} (util/with-close-on-catch [_ conn-socket]
+                                             (let [!conn-state (atom {:close-promise close-promise
+                                                                      :session {:access-mode :read-only
+                                                                                :clock (:clock @server-state)}})
+                                                   !closing? (atom false)]
                                                (-> (map->Connection {:cid cid, :node node, :authn authn, :server server,
                                                                      :frontend (pgio/->socket-frontend conn-socket),
                                                                      :!closing? !closing?
                                                                      :allocator (util/->child-allocator allocator (str "pg-conn-" cid))
                                                                      :conn-state !conn-state})
-                                                   (cmd-startup))
-                                               (catch EOFException _
-                                                 (reset! !closing? true))
-                                               (catch Throwable t
-                                                 (log/warn t "error on conn startup")
-                                                 (throw t)))))
-        conn (assoc conn
-                    :query-error-counter query-error-counter
-                    :query-timer query-timer
-                    :query-tracer query-tracer
-                    :tx-error-counter tx-error-counter
-                    :cancelled-connections-counter cancelled-connections-counter)]
+                                                   (cmd-startup)
+                                                   (assoc :query-error-counter query-error-counter
+                                                          :query-timer query-timer
+                                                          :query-tracer query-tracer
+                                                          :tx-error-counter tx-error-counter
+                                                          :cancelled-connections-counter cancelled-connections-counter))))]
+      (try
+        ;; the connection loop only gets initialized if we are not closing
+        (when (not @!closing?)
+          (when total-connections-counter
+            (.increment total-connections-counter))
+          (swap! server-state assoc-in [:connections cid] conn)
+          (conn-loop conn))
+        (finally
+          (close-all-portals conn)
+          (util/close conn)
 
+          ;; can be used to co-ordinate waiting for close
+          (when-not (realized? close-promise)
+            (deliver close-promise true)))))))
+
+(defn- connect [{:keys [server-state port] :as server} ^Socket conn-socket]
+  (let [cid (:next-cid (swap! server-state update :next-cid (fnil inc 0)))]
+    (log/debug "New connection" {:cid cid})
     (try
-      ;; the connection loop only gets initialized if we are not closing
-      (when (not @!closing?)
-        (when total-connections-counter
-          (.increment total-connections-counter))
-        (swap! server-state assoc-in [:connections cid] conn)
-
-        (conn-loop conn))
+      (connect* server conn-socket cid)
       (catch SocketException e
-        (when (or (= "Broken pipe" (.getMessage e))
-                  (= "Broken pipe (Write failed)" (.getMessage e))
-                  (= "Connection reset by peer" (.getMessage e)))
-          (log/debug "Client closed socket while we were writing" {:port port, :cid cid})
-          (.close conn-socket))
+       (when (or (= "Broken pipe" (.getMessage e))
+                 (= "Broken pipe (Write failed)" (.getMessage e))
+                 (= "Connection reset by peer" (.getMessage e)))
+            (log/debug "Client closed socket while we were writing" {:port port, :cid cid})
+            (.close conn-socket))
 
-        (when (= "Connection reset" (.getMessage e))
-          (log/debug "Client closed socket while we were reading" {:port port, :cid cid})
-          (.close conn-socket))
+       (when (= "Connection reset" (.getMessage e))
+            (log/debug "Client closed socket while we were reading" {:port port, :cid cid})
+            (.close conn-socket))
 
         ;; socket being closed is normal, otherwise log.
-        (when-not (.isClosed conn-socket)
-          (log/warn e "An exception was caught during connection" {:port port, :cid cid})))
+       (when-not (.isClosed conn-socket)
+            (log/warn e "An exception was caught during connection" {:port port, :cid cid})))
 
       (catch EOFException _
         (log/debug "Connection closed by client" {:port port, :cid cid}))
 
       (catch IOException e
-        (log/warn e "IOException in connection" {:port port, :cid cid}))
-
-      (catch Interrupted _)
-      (catch InterruptedException _)
-
-      (finally
-        (close-all-portals conn)
-        (util/close conn)
-
-        ;; can be used to co-ordinate waiting for close
-        (when-not (realized? close-promise)
-          (deliver close-promise true))))))
+        (log/warn e "IOException in connection" {:port port, :cid cid})))))
 
 (defn- accept-loop [{:keys [^ServerSocket accept-socket, ^ExecutorService thread-pool] :as server}]
   (try
@@ -1856,7 +1849,11 @@
             (let [conn-socket (.accept accept-socket)]
               (.setTcpNoDelay conn-socket true)
               ;; TODO fix buffer on tp? q gonna be infinite right now
-              (.submit thread-pool ^Runnable (fn [] (connect server conn-socket))))
+              (.submit thread-pool ^Runnable (fn []
+                                               (try
+                                                 (connect server conn-socket)
+                                                 (catch Interrupted _)
+                                                 (catch InterruptedException _)))))
             (catch SocketException e
               (when (and (not (.isClosed accept-socket))
                          (not= "Socket closed" (.getMessage e)))
